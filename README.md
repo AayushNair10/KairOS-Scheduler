@@ -97,6 +97,151 @@ every part. The loader is `scheduler/scx_kairos.c`.
   batch (E5, 6.38).
 - **Pool sizing.** No measurable effect on 3 CPUs (6.32, E15 in 6.37).
 
+## Design
+
+### The parts
+
+```
+ user space                         kernel
++-----------------------+          +---------------------------------------------+
+| scx_kairos (loader)   |  loads   | sched_ext core                              |
+|  - options -> BPF     |--------->|  calls kairos's callbacks when a task wakes,|
+|    constants          |          |  becomes runnable, starts or stops running, |
+|  - prints counters    |<---------|  and when a CPU needs work                  |
+|    every second       |   maps   |                                             |
++-----------------------+          | scx_kairos.bpf.c (policy)                   |
+                                   |  callbacks + a 1 ms timer + a wait timer    |
+                                   |                                             |
+                                   |  LC_DSQ (LC tasks)  BATCH_DSQ (batch tasks) |
+                                   |         \              /                    |
+                                   |  dispatch() moves the next task into a      |
+                                   |  CPU's local queue; the CPU runs it         |
+                                   |  [CPU 0 local] [CPU 1 local] [CPU 2 local]  |
+                                   +---------------------------------------------+
+```
+
+- **The policy** (`scheduler/scx_kairos.bpf.c`, C compiled to BPF) runs
+  inside the kernel. sched_ext calls it on scheduling events, and it
+  decides where each task goes. It started as a copy of the kernel's
+  `scx_simple` example.
+- **The loader** (`scheduler/scx_kairos.c`, user space) does three
+  things:
+  - Before loading, it writes the command-line options into the
+    policy's constants. The BPF verifier then sees them as fixed values
+    and removes code for features that are off.
+  - It marks which CPUs belong to the split.
+  - Once a second it prints the policy's counters (optionally as CSV
+    with `--stats`). Ctrl-C unloads the policy.
+- **If the policy misbehaves**, e.g. a task waits 30 s, the kernel
+  unloads it and goes back to EEVDF.
+
+### Queues and state
+
+- **Queues** (sched_ext *dispatch queues*):
+  - `LC_DSQ` and `BATCH_DSQ` are kairos's two shared queues, one per
+    class, used by every CPU.
+  - Each CPU also has its own *local* queue, which the kernel runs from.
+    Putting a task there means it runs on that CPU next.
+- **Order within a queue: virtual time,** as in `scx_simple`.
+  - A task's virtual time grows with the CPU time it uses, divided by
+    its weight (nice level).
+  - A task that slept gets back at most 20 ms of credit.
+  - So within a class, tasks share CPU time fairly.
+- **Per task** (BPF task storage, `struct task_ctx`):
+  - when it became ready to run, for wait times and the starvation
+    guard;
+  - when it started running, to charge its CPU time;
+  - `avg_run`: a moving average of how long it runs each time it
+    wakes, for the 1 ms rule;
+  - whether it is delayed, waiting for the wait timer.
+- **Per CPU** (`struct cpu_ctx`):
+  - whether the running task is batch, i.e. whether a task on an LC CPU
+    is a borrower, and when it started;
+  - `preempt_pending`: set once a wakeup has chosen to preempt this
+    CPU, cleared when the CPU switches tasks.
+- **Global:**
+  - `nr_lc`, the LC pool's size;
+  - `lc_demand`, the measured LC demand in CPUs × 1024 (BPF has no
+    floating point);
+  - the counters the loader prints.
+
+### Callbacks
+
+| Callback | When the kernel calls it | What kairos does |
+|---|---|---|
+| `select_cpu` | A task wakes up | Looks for an idle CPU: own pool first, then the other, the task's previous CPU first within each. If one is found, the task goes into that CPU's local queue and runs at once |
+| `enqueue` | A runnable task needs a place: no idle CPU was found, or it was preempted or its slice ran out | A woken LC task preempts a borrower (at once, or after the 1 ms wait). Otherwise the task goes into `LC_DSQ` or `BATCH_DSQ` by class |
+| `dispatch` | A CPU has nothing in its local queue | LC CPU: an overdue batch task first (guard), then `LC_DSQ`, then `BATCH_DSQ`. Batch CPU: an overdue LC task, then `BATCH_DSQ`, then `LC_DSQ` |
+| `runnable` | A task becomes ready to run | Notes the time, to measure its wait |
+| `running` | A task starts on a CPU | Records its wait. Notes in `cpu_ctx` whether a borrower now runs here. A batch task starting on an LC CPU gets its slice cut to the 3 ms borrow slice |
+| `stopping` | A task stops running | Charges its CPU time (virtual time, LC demand). If it went to sleep, updates `avg_run`. Clears the CPU's `preempt_pending` |
+| `quiescent`, `enable`, `init_task` | A task sleeps, joins or is created | Counting; initial virtual time; task storage |
+| `init`, `exit` | Load, unload | Creates the queues and starts the 1 ms timer; records why it exited |
+
+### How each mechanism is implemented
+
+- **Classification.** `task_batch()` returns true if the task's policy is
+  `SCHED_BATCH` or `SCHED_IDLE`. It is checked at each decision, so a
+  task changed with `chrt` while running moves class with its next
+  decision.
+- **Preempting a borrower** (in `enqueue`):
+  - It scans the LC CPUs for one whose `cpu_ctx` says a batch task is
+    running there. It takes the first in CPU order.
+  - It inserts the woken LC task into that CPU's local queue with
+    `SCX_ENQ_PREEMPT`. The kernel puts the task first and sets the
+    borrower's remaining slice to 0.
+  - So the borrower stops at once and returns through `enqueue` into
+    `BATCH_DSQ`.
+  - Batch tasks on batch CPUs are never preempted.
+- **One preemption per borrower** (`--claim-borrower`, `claim_victim()`).
+  - The scan skips CPUs with `preempt_pending` set.
+  - A wakeup sets the flag with an atomic compare-and-swap from 0 to 1.
+    Of two wakeups racing for the same CPU, only one wins.
+  - The loser takes another borrower, or waits in `LC_DSQ`.
+- **The 1 ms wait** (`--preempt-wait-us`, `--preempt-min-run-us`).
+  - **Which tasks preempt at once:** a woken LC task whose `avg_run`
+    is at least 100 µs.
+  - **The others** go into `LC_DSQ` marked *delayed*. Any LC CPU that
+    frees up in the meantime takes them, and a one-shot timer is armed
+    for 1 ms.
+  - **When the timer fires** (`wait_timerfn()`), it finds the first
+    delayed task that has waited 1 ms. It kicks one borrower's CPU with
+    `SCX_KICK_PREEMPT`, and that CPU then runs `dispatch()`, which takes
+    `LC_DSQ` first.
+  - It re-arms itself for the next delayed task.
+- **Lending.**
+  - An LC CPU with nothing in `LC_DSQ` takes a task from `BATCH_DSQ` in
+    `dispatch()`.
+  - `running()` shortens that task's slice to 3 ms, so the CPU comes
+    back soon even without a preemption.
+  - Slices: LC tasks 3 ms, batch tasks on batch CPUs 20 ms.
+- **Starvation guard** (`--max-wait-ms`, `run_overdue()`).
+  - Before a CPU takes from its own queue, `dispatch()` peeks at the
+    other queue's first task.
+  - If that task has waited longer than the limit, it runs first.
+  - The peek is cheap and lock-free, and the move happens only when
+    something is overdue.
+- **Pool sizing** (`update_split()`, every 1 ms tick).
+  - **One sample:** the CPU time LC tasks used in the tick, in CPUs,
+    plus one CPU for each LC task still waiting.
+  - **Demand:** a moving average of the samples over about 64 ms.
+  - **Pool size:** demand plus the buffer, rounded up, between
+    `--lc-min` and the number of split CPUs.
+  - **Shrinking** happens only if it would still happen with 0.25 CPU
+    more demand, so the pool doesn't flip back and forth.
+  - **Which CPUs are LC CPUs:** the first `nr_lc` split CPUs in CPU
+    order. CPUs outside `--split-cpus` act as LC CPUs.
+- **BPF constraints.** The verifier only accepts code it can prove safe.
+  So:
+  - every loop is bounded (`bpf_for`);
+  - every map and task-storage lookup is null-checked;
+  - all arithmetic is integer (CPUs × 1024, nanoseconds).
+
+The source also keeps the first design (`--adaptive` mode switching,
+`--force-preempt`, `--never-preempt`) and the options used only in
+experiments and ablations. All are off by default, and `--help` marks
+them.
+
 ## Results
 
 These come from a 4-vCPU VM (Apple M2 host, Linux 7.0):

@@ -5707,3 +5707,32 @@ search.
 **Problems:** none.
 
 **Next:** progress report, final report, video.
+
+### 2026-11-07 — README: the scheduler's design
+**Did:** Added a Design section to the README, at Aayush's request:
+- the parts (loader, BPF policy, sched_ext) with a diagram;
+- the queues and the per-task, per-CPU and global state;
+- a table of the callbacks, with when each is called and what kairos
+  does in it;
+- how each mechanism is implemented, with the function names:
+  - classification;
+  - borrower preemption via `SCX_ENQ_PREEMPT`;
+  - the claim's compare-and-swap;
+  - the 1 ms wait and its timer;
+  - lending and the borrow slice;
+  - the guard;
+  - pool sizing;
+  - the BPF constraints.
+
+Each statement was checked against `scheduler/scx_kairos.bpf.c` and
+`scx_kairos.c` at f1a065c.
+
+**Found:** nothing new.
+
+**Interpretation:** none.
+
+**Decisions:** none.
+
+**Problems:** none.
+
+**Next:** progress report, final report, video.
