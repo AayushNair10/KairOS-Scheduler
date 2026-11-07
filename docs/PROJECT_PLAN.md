@@ -9,20 +9,24 @@ between two preemption modes. The design changed during the work. The
 original plan is in git history, and RESEARCH_LOG records each change
 and why.
 
-## Status (2026-11-06)
-- **Evaluation done.** Every planned experiment has run or been replaced
-  (table below). The final evaluation F and the follow-ups E13, E15 and
-  E5 are analysed under rules set before their data existed (RESEARCH_LOG
-  5.1).
+## Status (2026-11-07)
+- **The scheduler project is complete.** Every planned experiment has
+  run, been replaced or been closed (table below). The final evaluation
+  F and the follow-ups E13, E15 and E5 are analysed under rules set
+  before their data existed (RESEARCH_LOG 5.1).
+- **The write-ups are in the log:**
+  - strict priority and batch starvation;
+  - Redis's CPU per completed GET (6.39);
+  - transitions, E4 (6.40).
 - **Main configuration:** kairos-pw1000r100 with the starvation guard.
-  That is the soft CPU split with delayed borrower preemption (1 ms), one
-  preemption per borrower and a 2 s maximum wait. Run it with
-  `scx_kairos --main-config`.
-- **Left:**
-  - figures;
-  - three short write-ups in the log (strict priority and kpw-r2, the
-    Redis per-request check, transitions from F's data);
-  - the progress report, final report and video.
+  - It is the soft CPU split with delayed borrower preemption (1 ms),
+    one preemption per borrower and a 2 s maximum wait.
+  - Run it with `scx_kairos --main-config`.
+  - Aayush kept the guard (2026-11-07) as a precaution. It never fired
+    in the measured workloads, and its lean in the guard check (6.36)
+    isn't significant.
+- **Left:** the progress report, final report and video. The figures
+  for them (`analysis/plots.py`) are a start.
 
 ---
 
@@ -157,7 +161,7 @@ The top comment describes every part. In short:
 | 6. Features A and B | Nov 14–21 | Classification, max wait | **Done.** Classification by run time (Oct 29) and by policy. Max wait (`--max-wait-ms`, Nov 5; GT, guard check). Budget and tree not built |
 | 7. Full evaluation | Nov 18–26 | Azure replay, burst-length sweep, overhead, Redis, all baselines | **Done** (Nov 1–6): E2a, E3, E7, E10–E15, G, F, E5 |
 | 8. ML | Nov 24–Dec 4 | Burst predictor vs simple ones; classifier if time | **Closed** (Nov 5), negative results: predictor ≈ bigger buffer; classifier not built |
-| 9. Wrap-up | Dec 4–11 | Figures, analysis, video, final report | **In progress:** README, `--main-config` done; figures next |
+| 9. Wrap-up | Dec 4–11 | Figures, analysis, video, final report | **Code and analysis done** (Nov 7): README, `--main-config`, figures, run checks in the repo, write-ups. Reports and video next |
 
 ---
 
@@ -176,7 +180,7 @@ Configurations:
 | E1 | Steady-load sweep | Done | No latency crossover between always and never preempt | 6.2–6.5 |
 | E2 | Bursty load vs baselines | Done | Mode switching gained little; the soft CPU split replaced it | 6.9–6.17 |
 | E3 | Burst-length sweep | Done | kairos busy p50 lowest at every burst length, for 6–20% less batch | 6.19, 6.21 |
-| E4 | Transitions | Not run on its own | To be written up from F's burst-sweep data | — |
+| E4 | Transitions | Done from F's data (Nov 7) | Every config is slower in a burst's first 10 ms; kairos least (+0.8 ms), eevdf most (5x, ~300 ms to settle). Only the configs that fall behind during bursts are slower after one | 6.40 |
 | E5 | Classification ablation | Done (Nov 6) | Run-time rule: busy p50 ×2.2 for +7% batch; labels kept | 6.38 |
 | E6 | Starvation stress | Done as GT | Without the guard a batch task ran 0 ms in 10 s; with it, waits stay ≈ 2 s | 6.33 |
 | E7 | Overhead | Done | Batch-only within ±3% of scx_simple; callbacks 4.1% of a CPU | 6.20 |
@@ -188,14 +192,15 @@ Configurations:
 | E13 | Dependency rule for the wait | Done (Nov 6) | No window passes; not adopted | 6.35 |
 | E14 | One preemption per borrower | Done | Adopted (`--claim-borrower`) | 6.30 |
 | E15 | Pool sizing | Done (Nov 6) | Doesn't pay on 3 CPUs | 6.37 |
-| G | Redis | Done | Redis p50 0.1 ms under kairos vs 0.5 under Linux and bpfland | 6.25 |
+| G | Redis | Done | Redis p50 0.1 ms under kairos vs 0.5 under Linux and bpfland; Redis uses 2.6x the CPU per GET under kairos (cause partly open) | 6.25, 6.39 |
 | F | Final evaluation | Done (Nov 5) | kairos-pw1000r100 beats bpfland on busy p50 at equal batch; kairos lowest latency | 6.32 |
 
 Method:
 - 10 interleaved reps in most experiments (3–5 in a few, such as E3),
   with cooldowns;
 - decision rules set before the data (RESEARCH_LOG 5.1);
-- run checks: VM share, other processes, swapping, reclaim, host speed.
+- run checks: VM share, other processes, swapping, reclaim, host speed
+  (`analysis/checks.py`).
 
 ---
 

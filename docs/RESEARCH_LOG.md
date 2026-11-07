@@ -1082,6 +1082,8 @@ result directories and the rows below keep the labels they ran under
 | E15 (burst) | 2026-11-06 | de9a99f | kairos-pw1000r100 (`--lc-buffer-pct=150`), kairos-pw1000r100-buf50 (`--lc-buffer-pct=50`) | `e15-pool-burst.conf` (E3's phases); `experiments/e13_e15_e5.sh`, 05:57–06:52, apt timers stopped | 10 | `results/2026-11-06-e15-pool-burst/` | Flagged (swap-ins): buf50-r2 (14,838), buf50-r3 (7,179), so n = 8. Reps 4–5 and 8–10 on the slower host (section 8). No metric differs at p < 0.05 (section 6.37) |
 | E15 (Azure) | 2026-11-06 | de9a99f (from 07:00 the tree was dirty: RESEARCH_LOG.md only) | as E15 (burst) | `e15-pool-azure.conf` (E2a's replay); started again by hand at 06:57 after the host-speed check stopped it at 06:52 (`night3.sh` in the scratchpad), 06:57–07:38 | 10 | `results/2026-11-06-e15-pool-azure/` | No run flagged. Reps 1–3 on the slower host (section 8). No metric differs at p < 0.05. Pool sizing doesn't pay on this machine (section 6.37) |
 | E5 | 2026-11-06 | de9a99f (tree dirty: RESEARCH_LOG.md only) | kairos-pw1000r100 (`--class=policy`), kairos-pw1000r100-classrun (`--class=run`: batch = ran 20 ms of CPU since it last slept) | `e5-class.conf` (E3's phases); started by hand at 07:40 after the host-speed check stopped it at 06:52 and 07:38 (`night4.sh` in the scratchpad), 07:40–08:36 | 10 | `results/2026-11-06-e5-class/` | No run flagged; server CPU per request 680–762 µs throughout. In rep 1 this Claude session used 8–12% of a CPU (log edits). `--class=run`: busy p50 +120%, busy >5 ms 12.7% → 38.6%, batch +7%, all p ≤ 0.006. The automatic rule doesn't match the labels (section 6.38) |
+| GR | 2026-11-07 | 02138b8 | offline, from G and G-nb's runs | `analysis/checks.py`: Redis CPU per completed GET, context switches per GET | 5, 3 | `results/2026-11-04-g-redis/`, `results/2026-11-04-g-redis-nobatch/` | Every run completed the same 658,954 GETs with no errors. Redis CPU per GET: kairos 2.6x eevdf with batch (24.4 vs 9.4 µs), 1.6x without (32.6 vs 20.2); with batch about 15–16 µs per preemption, but without batch kairos preempts nothing and still costs 12 µs more (section 6.39) |
+| E4 | 2026-11-07 | 02138b8 | offline, from F's burst sweep | `byburst.py`: latency by time since a burst started (bursts ≥ 1 s, `--min-length 1000`) and ended (all lengths) | 10 | `results/2026-11-05-final-burst/` | Every config is slower in the first 10 ms of a burst (10/10 reps; lavd 7–8/10): kairos ×1.9 (+0.8 ms), bpfland ×3.3, eevdf ×4.4 and settling only after 300 ms. After a burst eevdf, eevdfidle, kairos-never3 and lavd are 1.3–3.6x slower for 5–30 ms (10/10); kairos, kairos-pw1000r100 and bpfland not (section 6.40) |
 
 ### 5.1 Planned experiments
 | # | Experiment | Pattern | Shows |
@@ -2845,6 +2847,147 @@ Descriptive: quiet p50 1.04 → 1.19 ms (p = 0.002).
 - **Batch rarely borrows under `--class=run`:** 14 times fewer borrow
   starts. So the LC wakeups have fewer borrowers to preempt.
 
+### 6.39 Redis's CPU per completed GET (GR, from G and G-nb; offline, 2026-11-07)
+`analysis/checks.py` (02138b8) on `results/2026-11-04-g-redis/` and
+`results/2026-11-04-g-redis-nobatch/` (section 6.25). The reviewer
+asked for Redis's CPU per *completed* GET over matching intervals: a
+fixed offered rate is enough only if the achieved throughput and the
+backlog match too.
+
+- **The completed GETs match exactly.** All 39 runs completed 658,954
+  GETs with no errors. The schedule is fixed (seed 1), and the load
+  generator waits for every reply before run.sh's after-snapshot. The
+  CPU snapshots bracket the load plus 0.6–1.0 s of the load generator
+  starting and exiting, when Redis is idle.
+- So the ratio holds per completed GET. The three instances together,
+  median [range] over reps:
+
+| config | Redis CPU per GET (µs) | context switches per GET (all CPUs) | preemptions per GET |
+|---|---|---|---|
+| G: eevdf | 9.4 [9.1–10.4] | 5.92 | – |
+| G: eevdfidle | 9.7 [8.7–10.1] | 6.20 | – |
+| G: bpfland | 10.8 [10.0–11.4] | 3.92 | – |
+| G: kairos | 24.4 [23.4–26.1] | 6.69 | 1.02 |
+| G: kairos-pw50 | 15.7 [15.3–19.4] | 5.65 | 0.38 (all by the wait timer) |
+| G: kairos-pw200 | 13.0 [12.4–14.2] | 5.10 | 0.22 (all by the wait timer) |
+| G-nb: eevdf | 20.2 [19.1–21.0] | 8.35 | – |
+| G-nb: bpfland | 21.2 [21.2–21.9] | 6.88 | – |
+| G-nb: kairos | 32.6 [32.3–32.6] | 6.93 | 0 |
+
+- **kairos uses 2.6x eevdf's CPU per GET with batch and 1.6x without.**
+  The ranges don't overlap.
+- **With batch, the extra CPU tracks preemptions.** Above eevdf's
+  9.4 µs:
+
+  | config | extra µs per GET | preemptions per GET | extra µs per preemption |
+  |---|---|---|---|
+  | kairos | +15.0 | 1.02 | 14.7 (13.7–16.5 per run) |
+  | kairos-pw50 | +6.3 | 0.38 | 16.6 |
+  | kairos-pw200 | +3.6 | 0.22 | 16.4 |
+- **Without batch it doesn't.** In G-nb kairos preempts nothing (there
+  are no borrowers), yet Redis still uses 12.4 µs more per GET than
+  under eevdf.
+- **Context switches don't follow the CPU.**
+  - kairos has 13% more than eevdf with batch (6.69 vs 5.92) and 17%
+    fewer without (6.93 vs 8.35), while it uses 2.6x and 1.6x the CPU.
+  - They count every CPU's switches (zstd, the load generator), so they
+    bound Redis's wakeups only loosely.
+- **Batch halves eevdf's and bpfland's CPU per GET.**
+  - eevdf: 20.2 µs without batch, 9.4 with; switches per GET 8.35 →
+    5.92.
+  - bpfland: 21.2 → 10.8 µs; switches 6.88 → 3.92.
+  - kairos drops less: 32.6 → 24.4 µs.
+- **User and system time rise alike.** kairos against eevdf in G: user
+  9.3 vs 3.7 µs, system 15.1 vs 5.9. The kernel splits a task's exact
+  total by tick samples, so the split says little.
+- **Arithmetic, not a decomposition.**
+  - kairos's extra 15 µs per GET × 10,983 GETs/s is 0.16 CPU, 5.5% of
+    CPUs 0–2.
+  - kairos's batch was 6.4% below eevdf's (707 vs 755 MB/s).
+- **For gRPC the same gap is smaller.** In F (checks.py), server CPU
+  per request was 729 µs for kairos, 698 for kairos-pw1000r100 and 674
+  for eevdf (+8% and +4%).
+
+### 6.40 Transitions (E4, from F's burst sweep; offline, 2026-11-07)
+`byburst.py` (02138b8) on `results/2026-11-05-final-burst/`, 10 reps.
+- **What E4 was meant to measure:** latency spikes at mode switches.
+- **Why that no longer applies:** the final design has no modes, and
+  F's LC pool held 3 CPUs throughout (6.32).
+- **What this section measures instead:** how each scheduler handles
+  the load's own steps. A burst starts with a step from 500 to 3,500
+  req/s and ends with the step back.
+- Requests are binned by their intended send time since the step.
+
+**Burst start.**
+- **Bursts used:** 1, 3 and 10 s (`--min-length 1000`), 13 bursts per
+  run. Every bin up to 1 s pools the same bursts.
+- **Requests per run:** 141 in the 2–5 ms bin, 229 in the 5–10 ms bin.
+- **The table:** busy p50 (ms), median over reps.
+- **The last column:** per run, the higher of the 2–5 and 5–10 ms
+  bins' p50, divided by the 300–1000 ms bin's.
+  - It gives the median [range] over reps, and in how many reps the
+    ratio is above 1.
+  - Taking the higher of two bins favours values above 1 a little.
+
+| config | 0–2 | 2–5 | 5–10 | 10–30 | 30–100 | 100–300 | 300–1000 | onset / steady |
+|---|---|---|---|---|---|---|---|---|
+| kairos | 1.27 | 1.79 | 1.82 | 1.32 | 1.17 | 1.18 | 1.04 | ×1.90 [1.57–2.39], 10/10 |
+| kairos-fixed3 | 1.30 | 1.84 | 1.64 | 1.26 | 1.12 | 1.17 | 1.06 | ×1.63 [1.41–2.39], 10/10 |
+| kairos-pw1000r100 | 1.58 | 2.50 | 2.47 | 2.11 | 1.53 | 1.56 | 1.39 | ×1.97 [1.48–3.61], 10/10 |
+| bpfland | 2.30 | 4.73 | 4.67 | 2.41 | 1.88 | 1.77 | 1.52 | ×3.29 [2.29–3.72], 10/10 |
+| eevdfidle | 2.19 | 4.88 | 7.75 | 6.11 | 2.97 | 2.41 | 2.04 | ×3.50 [1.92–4.64], 10/10 |
+| kairos-never3 | 5.32 | 9.59 | 9.12 | 6.24 | 3.79 | 3.26 | 2.98 | ×3.29 [1.65–4.59], 10/10 |
+| eevdf | 4.03 | 12.14 | 15.85 | 18.42 | 17.46 | 7.72 | 3.69 | ×4.44 [2.35–4.98], 10/10 |
+| lavd | 4.83 | 10.68 | 13.74 | 14.27 | 16.50 | 18.48 | 8.05 | ×1.48 [0.43–2.85], 7/10 |
+| lavdperf | 4.78 | 8.71 | 14.17 | 14.29 | 18.03 | 20.51 | 8.63 | ×1.52 [0.46–2.02], 8/10 |
+
+- **Every config is slower in a long burst's first 10 ms than later in
+  it, kairos included.**
+- **kairos, kairos-fixed3, kairos-pw1000r100:** +0.8 to +1.1 ms at the
+  peak, settled by 30–100 ms.
+- **bpfland, eevdfidle, kairos-never3:** 3.3–3.5x, i.e. 4.7–9.6 ms,
+  most of the way back by 30–100 ms.
+- **eevdf:** it rises until 10–30 ms (18.4 ms, 5x its steady 3.7) and
+  is back only at 300–1000 ms. Its ratio above understates this, as
+  its peak comes after 10 ms.
+- **lavd:** slow throughout, worst at 100–300 ms (18–21 ms).
+- **The pooled view agrees but is milder.** It uses all burst lengths
+  (default bins; the early bins are mostly short bursts), and there
+  kairos's first three bins are 1.02–1.14 ms.
+
+**Burst end.**
+- **Bursts used:** all burst lengths pooled (default bins), 1,234 quiet
+  requests per run in the first 2 ms after a burst.
+- **The table:** quiet p50 (ms).
+- **The last column:** per run, the 0–2 ms bin over the 300–1000 ms
+  bin. The 300–1000 ms bin pools only the quiet phases of at least 1 s.
+
+| config | 0–2 | 2–5 | 5–10 | 10–30 | 30–100 | 300–1000 | first 2 ms / steady |
+|---|---|---|---|---|---|---|---|
+| kairos | 0.85 | 0.84 | 0.86 | 0.86 | 0.86 | 0.89 | ×0.95 [0.94–1.00], 1/10 |
+| kairos-fixed3 | 0.86 | 0.85 | 0.87 | 0.86 | 0.87 | 0.89 | ×0.97 [0.93–1.03], 2/10 |
+| kairos-pw1000r100 | 0.96 | 0.91 | 0.93 | 0.91 | 0.93 | 0.97 | ×1.02 [0.98–1.09], 6/10 |
+| bpfland | 1.04 | 0.97 | 0.98 | 0.95 | 0.96 | 1.03 | ×0.99 [0.94–1.12], 5/10 |
+| eevdfidle | 1.55 | 1.38 | 1.29 | 1.29 | 1.22 | 1.19 | ×1.28 [1.11–1.62], 10/10 |
+| eevdf | 2.41 | 1.68 | 1.45 | 1.33 | 1.23 | 1.21 | ×1.90 [1.66–2.22], 10/10 |
+| kairos-never3 | 2.28 | 1.42 | 1.11 | 1.01 | 1.03 | 1.11 | ×1.94 [1.56–3.28], 10/10 |
+| lavd | 3.97 | 2.44 | 1.28 | 1.08 | 1.03 | 1.09 | ×3.61 [3.34–4.54], 10/10 |
+| lavdperf | 3.95 | 2.35 | 1.22 | 1.08 | 1.04 | 1.11 | ×3.59 [3.20–4.32], 10/10 |
+
+- **No slowdown after a burst:** kairos, kairos-fixed3,
+  kairos-pw1000r100 and bpfland.
+- **The first quiet requests are slower** for eevdf, eevdfidle,
+  kairos-never3 and lavd: 1.3–3.6x. They are back to steady within:
+  - 5–10 ms for kairos-never3;
+  - 10–30 ms for lavd;
+  - 30–100 ms for eevdf and eevdfidle.
+- **Bursts of at least 1 s show the same.** The first 2 ms after the
+  burst:
+  - eevdf 2.62 ms, lavd 4.68;
+  - kairos 0.83.
+
+  But that bin has only 13 requests per run.
+
 ## 7. Explanations and insights
 (The "why" behind each result. This is what the report is graded on.)
 
@@ -3582,6 +3725,122 @@ GOMAXPROCS 3 (section 6.31):
     from its history across sleeps, not since its last sleep. Not
     tried.
 
+Strict service priority and batch starvation (sections 6.22, 6.33,
+6.36):
+- **kairos promises batch only what the service leaves.**
+  - On an LC CPU, an LC task always goes first. dispatch() serves
+    LC_DSQ before any borrower, and a woken LC task preempts a
+    borrower: at once, or after up to 1 ms in kairos-pw1000r100.
+  - In F the pool held all 3 CPUs, so batch only ever borrowed, in
+    the gaps the service left.
+  - So batch throughput is the service's idle time, less what the
+    preemptions cost.
+- **That is also where the latency comes from.** Under kairos, the
+  number of server threads doesn't matter, only whether one is
+  runnable (GOMAXPROCS 3, above). EEVDF shares CPUs by weight, and
+  bpfland favours tasks that sleep often (a guess, not checked in its
+  code). Under both, zstd can delay the server.
+- **When the service needs every CPU, batch stops.**
+  - **E10's kpw-r2 (6.22).** A 5 s overload with 18–29 runnable tasks:
+    - batch fell to 23 MB/s, from about 400;
+    - the longest wait of any task was 1.9 s;
+    - the trigger isn't known. The memory counters rule it out as far
+      as they show.
+  - **GT (6.33):** with 8 busy SCHED_NORMAL loops on 3 CPUs, a batch
+    loop ran 0 ms in 10 s.
+- **The guard bounds the wait, not the share.**
+  - **What it does:** with `--max-wait-ms=2000`, a task that has waited
+    past 2 s runs one borrow slice (≤ 3 ms) before the CPU's own queue.
+    That is about 0.15% of a CPU.
+  - **When it fired:** in GT about every 2 s (longest wait 2,004 ms);
+    in the burst sweep never (GS and E13's guard check: `overdue` 0 in
+    every run).
+  - **Why keep it:** it keeps a starved task under the sched_ext
+    watchdog's limit. kairos doesn't set `timeout_ms`, so the limit is
+    the kernel's 30 s, past which it would eject kairos.
+  - **Linux compared:** Linux gives SCHED_IDLE a weight of 3 against
+    nice 0's 1,024 (`WEIGHT_IDLEPRIO`, `kernel/sched/sched.h`). That's
+    about 0.3% of a CPU against one busy nice-0 task: the same order,
+    but a share instead of a bound.
+- **What kairos doesn't give is a minimum batch share.**
+  - If the service overloads for longer than the guard's limit, batch
+    gets about 0.15% of a CPU.
+  - The report should claim no more (the reviewer's point,
+    2026-11-04).
+  - A real deployment would pair kairos with admission control or a CPU
+    budget for the service. Feature B's budget was not built.
+
+Redis's CPU per GET (section 6.39):
+- **The 2.5x of 6.25 is real per completed GET (2.6x).** The same GETs
+  completed in every run, with no failures, so throughput and backlog
+  don't explain it.
+- **With batch, Redis pays about 15–16 µs per preemption.** That holds
+  for kairos, kairos-pw50 and kairos-pw200, whose preemption rates
+  differ by a factor of 4.6.
+  - **Guess:** a preempting Redis runs on a CPU whose cache zstd has
+    just filled, and it handles only a few GETs per wakeup, so it pays
+    the refill on almost every GET.
+  - When Redis waits instead (eevdf, or the delayed configs), it finds
+    more GETs queued per wakeup. Batch halving eevdf's CPU per GET fits
+    that.
+  - Not measured: there are no cache counters without perf.
+- **Without batch, kairos still costs 1.6x,** with no preemptions and
+  fewer context switches. So preemption isn't the whole cause, and the
+  rest is unknown.
+  - The next check is unchanged: `perf stat` on redis-server (cycles,
+    instructions, cache misses, syscalls per GET), which needs sudo.
+- **What it costs batch.**
+  - The extra Redis CPU (0.16 CPU) is about the size of kairos's batch
+    loss against eevdf (5.5% of the CPUs against 6.4%).
+  - So for Redis, much of kairos's batch cost may be Redis itself
+    working harder, rather than zstd being interrupted. That is a
+    guess from arithmetic.
+  - For gRPC the server's extra CPU is smaller (+8% per request in F).
+
+Transitions (section 6.40):
+- **A burst's start costs every scheduler something, kairos least.**
+  - kairos is about 0.8 ms slower in the first 10 ms of a long burst,
+    even with strict priority and a full LC pool.
+  - The pool needn't change, and each woken server thread preempts a
+    borrower at once. So what remains is probably the server's own
+    ramp-up: a sevenfold step in arrivals, with Go waking more threads
+    as work queues up. A guess; not traced.
+  - kairos-fixed3 shows the same (×1.6), so it isn't the pool's sizing.
+- **kairos-pw1000r100's onset rise is about 0.3 ms larger than
+  kairos's** (+1.1 against +0.8 ms).
+  - That fits the 1 ms wait hitting the short-running threads that
+    wake first. A guess.
+- **bpfland, kairos-never3 and eevdfidle mostly settle by 30–100 ms.**
+  - **kairos-never3:** a woken server thread waits for the running zstd
+    slice (≤ 3 ms), and the requests that arrive meanwhile queue
+    behind it.
+  - **bpfland (a guess):** threads that slept through the quiet phase
+    may need some time at the new rate before it treats them as
+    interactive. Not checked in its code.
+  - **eevdfidle:** why it delays the server at all is still open (E11,
+    G).
+- **eevdf takes about 300 ms.** It gets worse for 10–30 ms, to 5x its
+  steady latency, then recovers within the burst.
+  - **Guess, consistent with GOMAXPROCS 3 (6.31).** At the step, the
+    server's few active threads share the CPUs fairly with zstd and
+    fall behind. As Go's queues grow, it wakes more threads (up to 16
+    Ps). Under fair sharing each runnable thread adds to the server's
+    share, until the server outweighs zstd.
+  - At GOMAXPROCS 3 that can't happen, and EEVDF's queue grew for as
+    long as each burst lasted.
+- **After a burst, the slowness is backlog.**
+  - The configs that fall behind during bursts carry a queue into the
+    quiet phase, and the first quiet requests wait behind it. These are
+    eevdf, eevdfidle, kairos-never3 and lavd, with busy p50 2.4–8.6 ms
+    (6.32).
+  - The queue clears within 5–100 ms.
+  - kairos, kairos-pw1000r100 and bpfland keep up during bursts, so
+    nothing is left to drain.
+- **E4's original question doesn't arise.** With no modes and a fixed
+  pool there are no switches to cause spikes. The transitions left are
+  the load's own, and kairos handles both edges best of the configs
+  measured.
+
 ---
 
 ## 8. Limitations
@@ -3829,6 +4088,17 @@ GOMAXPROCS 3 (section 6.31):
     6.36.
   - An order that rotates by one config each rep would avoid this.
 
+- **Transitions (6.40) cover one step, one server.**
+  - The step is 500 ↔ 3,500 req/s, with the gRPC server at GOMAXPROCS
+    16.
+  - The onset bins hold 141–229 requests per run. Bins are by intended
+    send time.
+  - F's runs also had my wait process (above).
+- **Redis's extra CPU under kairos is only partly explained (6.39).**
+  - perf wasn't run (it needs sudo).
+  - The context switches counted are system-wide.
+  - The user/system split is tick-sampled.
+
 ---
 
 ## 9. Open questions
@@ -3911,6 +4181,11 @@ GOMAXPROCS 3 (section 6.31):
 - (G.) Why does Redis use 2.5x the CPU under kairos, also without batch?
   Next check: perf stat on redis-server (cycles, syscalls per request)
   under eevdf and kairos.
+  - **Added 2026-11-07 (6.39).** Per completed GET it is 2.6x (1.6x
+    without batch), with the same GETs completed in every run.
+    - With batch: about 15–16 µs per preemption.
+    - Without batch: 12 µs more per GET with no preemptions.
+    - Still open; perf stat not run.
 - (E10.) Do workers preempt more with delayed preemption because they
   lose the CPUs the short threads used to open for them (guess in
   section 7)?
@@ -5268,3 +5543,83 @@ checked, none of them depends on the slowed reps.
   check, transitions (E4) from F's data.
 - Progress report (needs Aayush's callback screenshot), final report,
   video.
+
+### 2026-11-07 — Guard kept; run checks in the repo; write-ups (strict priority, Redis per GET, E4)
+**Did:**
+- `analysis/checks.py` (02138b8). It runs F's run checks and reports
+  the service's CPU per completed request (user/system) and context
+  switches per request, per run in run order. It replaces the scratchpad
+  helpers `health.py` and `drift.py`.
+  - `runlib.proc_times()` keeps user and system time apart.
+    `proc_cpu()` gives the same numbers as before on 60 runs.
+- `byburst.py --min-length L`: time bins from bursts at least L long.
+  The default output is byte-identical on F.
+- Offline, from existing data:
+  - GR: Redis's CPU per completed GET (6.39);
+  - E4: transitions, from F (6.40);
+  - per-rep checks of both (scratchpad `e4_perrep.py`, copied to
+    `~/kairos-data/scratchpad-2026-11-07/`).
+- Write-ups in section 7:
+  - strict service priority and batch starvation;
+  - Redis's CPU per GET;
+  - transitions.
+- Section 8: limits of both analyses. Section 9: a dated note under the
+  Redis question. PROJECT_PLAN, README and CLAUDE.md updated.
+
+**Found:**
+- **checks.py reproduces the logged checks.** F's burst sweep: none
+  flagged; worst VM share 0.97, other processes 14.2%, 81 swap-ins, 54
+  reclaim stalls (6.32). Server CPU per request: config medians 666–729
+  µs, rep medians 670–733 (6.32's drift numbers).
+- **Redis** (6.39):
+  - All 39 G and G-nb runs completed the same 658,954 GETs, with no
+    errors.
+  - kairos uses 2.6x eevdf's Redis CPU per GET with batch and 1.6x
+    without.
+  - With batch, about 15–16 µs per preemption across kairos,
+    kairos-pw50 and kairos-pw200. Without batch, 12 µs more with no
+    preemptions.
+- **Transitions** (6.40):
+  - **Burst start:** every config is slower in a long burst's first
+    10 ms, in 10/10 reps (lavd 7–8/10). kairos +0.8 ms (×1.9), bpfland
+    ×3.3, eevdf ×4.4 and about 300 ms to settle.
+  - **Burst end:** eevdf, eevdfidle, kairos-never3 and lavd are
+    1.3–3.6x slower for 5–100 ms (10/10). kairos, kairos-pw1000r100 and
+    bpfland are not.
+
+**Interpretation:**
+- **Strict priority** is where kairos's latency comes from. Its cost is
+  that batch gets only the service's idle time; the guard bounds a
+  starved task's wait, not its share.
+- **Redis:** with batch, much of kairos's batch loss may be Redis
+  working harder per GET, not zstd being interrupted. That is
+  arithmetic plus a guess. The no-batch gap is unexplained.
+- **Transitions:**
+  - kairos handles both edges of a burst best. Its small onset delay is
+    probably the server's own ramp-up (a guess).
+  - eevdf's slow recovery fits Go adding threads under fair sharing
+    (a guess, consistent with GOMAXPROCS 3).
+
+**Decisions:**
+- **(Aayush) The guard stays in the main configuration** as a
+  precaution. It never fired in the measured workloads, and its lean in
+  the guard check (6.36) isn't significant. No overhead check will run.
+- **No flag on server CPU per request.** checks.py prints it, but no
+  run is excluded on it, and no further runs are planned. If runs
+  resume, the rule has to be set before them (section 8).
+- **The scheduler project is complete;** the reports and the video
+  are next (Aayush).
+
+**Problems:**
+- **My last message on 2026-11-06 was wrong.** It said b4f4958–52fda7c
+  were local only. origin/main had already been pushed at 13:33 that
+  day, not from this session.
+- **My first E4 cut, bursts of exactly 1 s or 10 s, had too few
+  requests** in the early bins (8 or 2 bursts per run). I changed it to
+  bursts of at least 1 s, 13 per run.
+
+**Next:**
+- Progress report (needs Aayush's screenshot of the callback output),
+  final report, video.
+- Optional, with sudo: `perf stat` on redis-server under eevdf and
+  kairos (section 9).
