@@ -6,35 +6,103 @@ targets a latency-critical (LC) service that shares CPUs with batch work.
 The aim is low request latency for the service, while batch work keeps
 most of its throughput.
 
+kairos is not an operating system. It is a scheduling policy that runs
+inside an ordinary Linux kernel through sched_ext. Linux still does
+everything else. kairos only decides which runnable thread runs on which
+CPU, and when. If kairos stops, Linux goes back to its own scheduler.
+
 ## How it works
 
-- **Soft CPU split** (`--split`). The CPUs it manages form two pools:
-  - **LC CPUs**, a pool sized to the service's measured CPU demand plus a
-    buffer;
-  - **batch CPUs**, the rest.
+### Words used here
 
-  Each pool serves its own queue first and lends idle CPUs to the other.
-  A batch task on an LC CPU (a *borrower*) gets a short slice.
-- **Preempting borrowers.** A woken LC task that finds no idle CPU
-  preempts a borrower. With `--preempt-wait-us`, a short LC task first
-  waits up to that long for an LC CPU to free up. That trades a little
-  latency for batch throughput.
-- **One preemption per borrower** (`--claim-borrower`). A second LC
-  wakeup can't pick a borrower that is already being preempted.
-- **Starvation guard** (`--max-wait-ms`). When a CPU is about to run
-  its own pool's queue, a task of the other pool that has waited past the
-  limit runs first.
-- **Classification by scheduling policy** (`--class=policy`). Batch work
-  is whatever runs as `SCHED_BATCH` or `SCHED_IDLE`, e.g. under
-  `chrt --batch 0`.
+- **LC (latency-critical) task:** a thread someone is waiting on, e.g. a
+  server thread answering a request. What counts is its response time.
+- **Batch task:** background work that nobody waits on moment to moment,
+  e.g. compressing files. What counts is its throughput.
+- **Class:** whether kairos treats a task as LC or batch. A task is batch
+  if it runs under Linux's `SCHED_BATCH` or `SCHED_IDLE` policy (start it
+  with `chrt --batch 0 CMD`); everything else is LC (`--class=policy`).
+  The class comes from that label, and kairos never changes it.
+- **Pools:** the CPUs kairos manages are split into LC CPUs and batch
+  CPUs. Each pool has one queue shared by all its CPUs.
+- **Borrower:** a batch task running on an LC CPU, because no LC task
+  needed that CPU.
+- **Preempting:** stopping a running task before its time slice ends, so
+  another task can run.
+
+### What happens to a task
+
+1. **It wakes up**, e.g. a server thread because a request arrived. If
+   a CPU is idle, the task runs there at once. kairos looks in the
+   task's own pool first, then in the other pool. Within each, it tries
+   the task's previous CPU first, whose cache may still hold its data.
+2. **No CPU is idle, and the task is LC.** If a borrower is running on
+   an LC CPU, kairos stops it and gives the CPU to the LC task. The
+   borrower goes back to the batch queue. Two refinements:
+   - **The 1 ms wait** (`--preempt-wait-us=1000
+     --preempt-min-run-us=100`). Most wakeups come from runtime threads
+     that run for about 10 µs. If a task's runs average under 100 µs, it
+     first waits up to 1 ms for a CPU to free up on its own. Only then is
+     a borrower stopped. Request workers, whose runs are longer, still
+     stop a borrower at once. This cuts preemptions by about 90% and
+     gives batch work more CPU.
+   - **One preemption per borrower** (`--claim-borrower`). Two LC tasks
+     that wake at the same moment stop two different borrowers, not the
+     same one twice.
+3. **Otherwise the task waits** in its pool's shared queue. Batch tasks
+   never preempt anyone.
+4. **A CPU that needs work** takes the next task from its own pool's
+   queue. If that queue is empty, it takes one from the other pool's
+   queue: it lends itself. No CPU stays idle while either queue holds
+   work. A borrower gets a short slice, so the CPU comes back soon.
+5. **The starvation guard** (`--max-wait-ms=2000`). A task that has
+   waited 2 s runs before the CPU's own queue. That bounds how long it
+   waits, not how much CPU it gets.
+6. **Pool sizing.** A timer measures the CPU that LC tasks use and
+   need. It makes the LC pool that much plus a buffer (1.5 CPUs),
+   rounded up. On
+   the 3-CPU test machine, the pool stayed at all 3 CPUs, so batch work
+   only ever borrowed.
 
 The policy is `scheduler/scx_kairos.bpf.c`; its top comment describes
 every part. The loader is `scheduler/scx_kairos.c`.
 
+### kairos and Linux compared
+
+| | Linux's default (EEVDF) | kairos |
+|---|---|---|
+| Queues | One per CPU | One per class, shared by all CPUs of its pool |
+| Idle CPUs | A woken task is placed on an idle CPU if one is found. Idle CPUs pull tasks from busy ones, and periodic load balancing moves more | Take the next task from a shared queue: their own pool's, else the other's |
+| How CPU time is divided | By weight. Over time every task gets its share; a woken task preempts if its virtual deadline is earlier | By class. On LC CPUs, LC tasks always go first; batch gets what is left |
+| `SCHED_BATCH` tasks | The same share as normal tasks; they just don't preempt others on wakeup | Batch: they borrow CPUs the LC tasks leave idle |
+| `SCHED_IDLE` tasks | A tiny share (weight 3 against 1,024). A woken normal task preempts them at once, and a CPU running only them counts as idle | Batch, as above |
+| Reserving CPUs | cpusets: a hard split, so unused reserved CPUs stay idle | A soft split: unused LC CPUs are lent to batch work and taken back when needed |
+| Delayed preemption | No equivalent | Short-running LC tasks wait up to 1 ms before a borrower is stopped |
+
+### What each part contributes (measured; section numbers in `docs/RESEARCH_LOG.md`)
+
+- **Preempting only batch tasks.** On the original single-queue design
+  at 3,500 req/s, preempting only batch tasks gave a 1.0 ms median.
+  Never preempting, with 3 ms slices, gave 3.5 ms (E1c, 6.5). Preempting request threads
+  too hurt latency at every load, because a request gets paused halfway
+  (E1b, 6.4).
+- **The shared LC queue.** With a queue per CPU instead, the busy median
+  rose from 0.86–1.04 ms to 1.46–1.71 ms (E12, 6.24; 3 reps).
+- **The 1 ms wait.** About 90% fewer preemptions (E11, 6.23) and 10%
+  more batch throughput, for a 28% higher busy median (F, 6.32).
+- **One preemption per borrower.** Busy median −2% for kairos; no
+  significant difference for kairos-pw1000r100 (E14, 6.30).
+- **Classification by label.** Classifying tasks by how long they run,
+  instead of by label, more than doubled the busy median, for 7% more
+  batch (E5, 6.38).
+- **Pool sizing.** No measurable effect on 3 CPUs (6.32, E15 in 6.37).
+
 ## Results
 
 These come from a 4-vCPU VM (Apple M2 host, Linux 7.0):
-- a Go gRPC server and 2 zstd jobs ran on CPUs 0–2;
+- on CPUs 0–2, a Go gRPC server (16 worker threads, 500 µs of CPU work
+  per request) and, as the batch work, 2 single-threaded zstd jobs
+  compressing the same 64 MB file over and over;
 - an open-loop load generator ran on CPU 3;
 - 10 interleaved reps per configuration;
 - tests: Wilcoxon signed-rank paired by rep, with Holm correction.

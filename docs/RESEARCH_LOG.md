@@ -354,6 +354,56 @@ https://www.usenix.org/conference/nsdi22/presentation/mcclure,
 https://research.google/pubs/ghost-fast-and-flexible-user-space-delegation-of-linux-scheduling/,
 https://sysartifacts.github.io/eurosys2022/summaries/nest
 
+### 2.12 Is kairos's mechanism new? (checked 2026-11-07)
+Aayush asked whether the design has been done before. Checked:
+- sections 2.10–2.11;
+- the sched_ext schedulers in `~/scx` (commit 4c6375910);
+- web searches (abstracts and summaries, not full papers).
+
+A limited search, so "not found" means not found here, not that it
+doesn't exist.
+
+| kairos part | Prior work found | Verdict |
+|---|---|---|
+| Soft CPU split, idle CPUs lent to batch | PerfIso (fixed buffer of idle cores), SmartHarvest (EuroSys 2021: buffer sized by an online-learned predictor of the LC VMs' core demand), Meta's ads sched_ext policy (two pools by load heuristics), scx_layered (layers with CPU budgets, unused CPUs lent), Heracles, Shenango, Caladan, Grouper (arXiv 2609.14123, Sep 2026: core allocation between µs-scale services and batch) | Not new |
+| A woken LC task preempts batch work at once | Linux SCHED_IDLE (since 2019), UFS (sched_ext, May 2026), Elfen (ATC 2016: batch borrows an SMT lane and yields when a request arrives), LibPreemptible, scx_layered's `preempt` layers | Not new |
+| Predicting LC demand to size the pool (ML) | SmartHarvest | Not new (and no gain here) |
+| Load-adaptive preemption, the original idea | LibPreemptible (adjusts its preemption interval to the request rate), IX (batches only under congestion) | Not new, and its premise failed here (E1, E1c) |
+| Short-running LC threads wait up to 1 ms, then preempt; longer ones preempt at once | Nearest: EEVDF's slice protection and RUN_TO_PARITY, CFS's wakeup granularity (they protect the running task for a while, whatever its class); scx_layered's `AvgRuntime` match with per-layer `preempt` (could stop short-running threads from preempting, but has no bounded wait); Perséphone's DARC (reserves cores for short *requests*: the opposite direction) | Not found as such |
+| One preemption per borrower | Claiming a CPU before kicking it is common in sched_ext schedulers (`scx_bpf_test_and_clear_cpu_idle()` for idle CPUs) | A fix, not a contribution |
+
+**What this means for the report.**
+- **Not new: the architecture.** That covers the split, lending,
+  preempting borrowers and demand prediction. It should be presented as
+  known, with these systems cited.
+- **Possibly new, small: the delayed-preemption rule.** It waits by
+  the woken LC thread's typical run length, with a bounded wait. It is
+  a variant of known slice protection, keyed on the preemptor, not the
+  running task. It is the one piece with a measured effect of its own:
+  bpfland's batch throughput at a 12% lower busy median (6.32).
+- **The evaluation's findings:**
+  - no load crossover for wakeup preemption once only batch is
+    preempted (E1, E1c);
+  - why the shared LC queue matters (E12);
+  - why EEVDF depends on the Go thread count (6.31);
+  - the cost per preemption for Redis (6.39);
+  - transitions (6.40).
+
+  They are measured on one small VM. That is the main limitation of
+  any claim.
+
+Sources: https://www.microsoft.com/en-us/research/?p=737704,
+https://www.usenix.org/conference/atc16/technical-sessions/presentation/yang,
+https://arxiv.org/abs/2308.02896,
+https://arxiv.org/abs/2609.14123,
+https://par.nsf.gov/biblio/10333250,
+https://patchew.org/linux/20250704143612.998419-1-vincent.guittot@linaro.org,
+https://patchew.org/linux/20240727102732.960974693@infradead.org/20240727105030.735459544@infradead.org,
+https://arxiv.org/abs/2605.02377,
+`~/scx/scheds/rust/scx_layered/src/config.rs` and `src/main.rs`
+(`AvgRuntime`, `preempt`, `disallow_preempt_after_us`); sections
+2.10–2.11 for the rest.
+
 ---
 
 ## 3. Design
@@ -5623,3 +5673,37 @@ checked, none of them depends on the slowed reps.
   final report, video.
 - Optional, with sudo: `perf stat` on redis-server under eevdf and
   kairos (section 9).
+
+### 2026-11-07 — README explains the design; novelty check
+**Did:**
+- README:
+  - a note that kairos is a scheduling policy, not an OS;
+  - definitions of LC, batch, class, pools, borrower and preempting;
+  - a step-by-step account of what happens to a task;
+  - a table comparing kairos with Linux;
+  - what each part contributes, with the experiment behind it;
+  - what the zstd jobs are.
+- Novelty check: the scx sources on this VM and web searches (section
+  2.12).
+
+**Found:**
+- **The split, lending, preempting borrowers and demand prediction all
+  have prior work.** It includes SmartHarvest, Elfen, Linux SCHED_IDLE,
+  UFS, scx_layered, Meta's ads policy and Grouper.
+- **The original idea, load-adaptive preemption, has prior work too**
+  (LibPreemptible).
+- **Not found as such: the delayed-preemption rule.** Short-running LC
+  threads wait up to 1 ms, longer ones preempt at once. The nearest
+  relatives are EEVDF's slice protection, and scx_layered's
+  run-time-matched layers.
+
+**Interpretation:** the report should present the architecture as
+known. The delayed-preemption rule and the measured explanations are
+the contribution. The novelty claim for the rule rests on a limited
+search.
+
+**Decisions:** none.
+
+**Problems:** none.
+
+**Next:** progress report, final report, video.
