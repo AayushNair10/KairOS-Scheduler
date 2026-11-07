@@ -76,7 +76,8 @@ scripts/        helpers (log_entry.sh, meta.sh)
 - Compare configurations (per phase, paired counts): `./analysis/compare.py results/<date>-<name>`
 - Spread across reps: `./analysis/aggregate.py results/<date>-<name>`; slow episodes vs GC: `./analysis/episodes.py <run>`
 - Many-phase patterns: by busy/quiet `./analysis/byrate.py results/<date>-<name> --ref kairos`; by load level and window `./analysis/bylevel.py results/<date>-<name> --ref kairos [--windows N]`
-- Burst-length sweep: phases `./workloads/traces/burst_sweep.py --seed 1`; analysis `./analysis/byburst.py results/<date>-<name> --ref kairos`
+- Burst-length sweep: phases `./workloads/traces/burst_sweep.py --seed 1`; analysis `./analysis/byburst.py results/<date>-<name> --ref kairos [--min-length 1000]` (`--min-length`: latency by time since a burst started/ended from bursts at least that long only)
+- Run checks (F's flags) and the service's CPU per completed request, per run in run order: `./analysis/checks.py results/<date>-<name>`
 - Azure trace phases: `./workloads/traces/azure_phases.py ~/kairos-data/azure2021/AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt --pick 3 --seed 1 > workloads/traces/<name>.phases`
 - Redis instead of grpcserver: `SERVICE=redis` in a config (see `experiments/configs/g-redis.conf`)
 - Waits and preempting runs per task group (`DIAG_COMM` runs): `./analysis/diag.py results/<date>-<name>`

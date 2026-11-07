@@ -10,12 +10,14 @@ phases (failed requests count as infinitely slow), p50 and >5 ms in quiet
 phases, and batch MB/s over the block (run_stats also pools every length,
 key L = "all", for stats.py). Then the same for busy requests by
 time since their burst started, and for quiet requests by time since the
-burst ended (a time bin pools the phases that last at least to its end).
-Median over reps; then, against --ref, in how many reps each config was
-better.
+burst ended (a time bin pools the phases that last at least to its end, so
+early bins come mostly from short bursts and late bins from long ones;
+--min-length L takes the time bins from phases at least L ms long only, so
+every bin up to L pools the same bursts). Median over reps; then, against
+--ref, in how many reps each config was better.
 
 Usage: analysis/byburst.py results/<date>-<name> [--ref CONFIG]
-       [--skip-reps N ...]
+       [--skip-reps N ...] [--min-length L]
 """
 import argparse
 import csv
@@ -43,7 +45,9 @@ def stats(lat):
     return out
 
 
-def run_stats(run_dir):
+def run_stats(run_dir, bins_min_length=0):
+    """(lengths, {key: stats}); bins_min_length: time bins from phases at
+    least that long (ms) only."""
     ph = runlib.load_summary(run_dir)["phases"]
     busy_rate = max(p["target_rps"] for p in ph)
     dur = [round(p["duration_s"] * 1000) for p in ph]
@@ -65,6 +69,8 @@ def run_stats(run_dir):
             lat.setdefault((kind, "all"), []).append(v)  # every length together
             # Time since this phase started: since the burst started (busy)
             # or since it ended (quiet); the bin must end within the phase.
+            if L < bins_min_length:
+                continue
             off = int(r["intended_ns"]) / 1e6 - begin[i]
             for a, b in zip(BINS_MS, BINS_MS[1:]):
                 if a <= off < b and b <= L:
@@ -82,13 +88,15 @@ def main():
     ap.add_argument("dir")
     ap.add_argument("--ref")
     ap.add_argument("--skip-reps", type=int, nargs="+", default=[])
+    ap.add_argument("--min-length", type=int, default=0,
+                    help="time bins from bursts at least this long (ms) only")
     a = ap.parse_args()
     runs = aggregate.runs_by_config(a.dir, a.skip_reps)
     data, lengths = {}, None
     for n in sorted(runs):
         data[n] = []
         for d in runs[n]:
-            lengths, s = run_stats(d)
+            lengths, s = run_stats(d, a.min_length)
             data[n].append(s)
 
     def med(rs, k, c):
@@ -107,9 +115,10 @@ def main():
                   + f" {med(rs, ('quiet', L), 'p50'):7.2f} {med(rs, ('quiet', L), '>5'):6.2f}"
                   + f" {med(rs, ('block', L), 'mbs'):7.0f}")
     bins = [f"{x}-{y}" for x, y in zip(BINS_MS, BINS_MS[1:])]
+    only = f", bursts of at least {a.min_length} ms" if a.min_length else ""
     for kind, what in (("busy", "since the burst started"), ("quiet", "since the burst ended")):
         for c in ("p50", ">5"):
-            print(f"== {kind} requests by time {what} (ms): {c}")
+            print(f"== {kind} requests by time {what} (ms{only}): {c}")
             print("  config     " + " ".join(f"{b:>8s}" for b in bins))
             for n, rs in data.items():
                 print(f"  {n:10s} " + " ".join(f"{med(rs, (kind, b), c):8.2f}" for b in bins))

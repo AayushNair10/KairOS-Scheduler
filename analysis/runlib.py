@@ -130,7 +130,7 @@ def pressure_stats(run_dir):
 
 
 def _read_procs(path):
-    """{pid: (comm, utime + stime in ticks, start time in ticks since boot)}
+    """{pid: (comm, utime, stime, start time)} in ticks (start: since boot)
     from concatenated /proc/<pid>/stat."""
     out = {}
     with open(path, errors="replace") as f:
@@ -142,7 +142,7 @@ def _read_procs(path):
             rest = line[rp + 2:].split()
             # rest[0] is field 3 (state); utime and stime are fields 14, 15;
             # starttime is field 22.
-            out[int(line[:lp])] = (line[lp + 1:rp], int(rest[11]) + int(rest[12]),
+            out[int(line[:lp])] = (line[lp + 1:rp], int(rest[11]), int(rest[12]),
                                    int(rest[19]))
     return out
 
@@ -157,26 +157,35 @@ def other_cpu(run_dir):
     a = _read_procs(before)
     b = _read_procs(os.path.join(run_dir, "procs_after"))
     by_comm = {}
-    for pid, (comm, t, start) in b.items():
+    for pid, (comm, ut, st, start) in b.items():
         if comm in EXPERIMENT_COMMS:
             continue
         # Same process if the pid has the same start time (pids get reused;
         # names don't identify it: kworkers rename themselves after the
         # work item they run, e.g. kworker/2:2-events -> -mm_percpu_wq).
-        prev = a[pid][1] if pid in a and a[pid][2] == start else 0
+        t = ut + st
+        prev = sum(a[pid][1:3]) if pid in a and a[pid][3] == start else 0
         if t > prev:
             by_comm[comm] = by_comm.get(comm, 0) + (t - prev) / USER_HZ
     return sorted(by_comm.items(), key=lambda kv: -kv[1])
 
 
-def proc_cpu(run_dir, comm):
-    """CPU seconds used during the load by the processes named comm that
-    ran through both snapshots (all their threads; a process that started
-    or exited in between, like each zstd of the batch loop, is missed)."""
+def proc_times(run_dir, comm):
+    """(user, system) CPU seconds used during the load by the processes
+    named comm that ran through both snapshots (all their threads; a
+    process that started or exited in between, like each zstd of the batch
+    loop, is missed)."""
     a = _read_procs(os.path.join(run_dir, "procs_before"))
     b = _read_procs(os.path.join(run_dir, "procs_after"))
-    return sum(t - a[pid][1] for pid, (c, t, start) in b.items()
-               if c == comm and pid in a and a[pid][2] == start) / USER_HZ
+    same = [(pid, ut, st) for pid, (c, ut, st, start) in b.items()
+            if c == comm and pid in a and a[pid][3] == start]
+    return (sum(ut - a[pid][1] for pid, ut, _ in same) / USER_HZ,
+            sum(st - a[pid][2] for pid, _, st in same) / USER_HZ)
+
+
+def proc_cpu(run_dir, comm):
+    """CPU seconds (user + system) of proc_times()."""
+    return sum(proc_times(run_dir, comm))
 
 
 def sut_cpus(run_dir):

@@ -168,8 +168,9 @@ keep a laptop host awake and plugged in (e.g. `caffeinate` on macOS).
 
 ```sh
 ./analysis/summarize_run.py results/<date>-<name>/<run>          # one run
+./analysis/checks.py results/<date>-<name>                        # run checks, service CPU per request
 ./analysis/stats.py results/<date>-<name> --ref kairos            # tests against a reference
-./analysis/byburst.py results/<date>-<name> --ref kairos          # burst sweep, per burst length
+./analysis/byburst.py results/<date>-<name> --ref kairos          # burst sweep, per burst length and time since a burst started/ended
 ./analysis/bylevel.py results/<date>-<name> --ref kairos          # Azure replay, per load level
 ```
 
