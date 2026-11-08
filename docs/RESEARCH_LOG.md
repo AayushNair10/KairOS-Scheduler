@@ -5736,3 +5736,63 @@ Each statement was checked against `scheduler/scx_kairos.bpf.c` and
 **Problems:** none.
 
 **Next:** progress report, final report, video.
+
+### 2026-11-08 — Progress report drafted (USENIX template, 3 pages)
+**Did:** Wrote the progress report in LaTeX at Aayush's request, with
+the emphasis Aayush asked for: why the proposal's plan was dropped and
+how the current design differs; the final design and full evaluation
+are left to the final report.
+- Template: the official USENIX files listed on
+  usenix.org/conferences/author-resources/paper-templates
+  (`usenix2019_v3.2.tex`, `usenix2019_v3.sty`), unmodified. The OSDI '27
+  call asks for 10 pt on 12 pt leading, two columns, a 7" x 9" text
+  block and numbered pages; the style gives all four.
+- Contents:
+  - status;
+  - why the plan changed: E1, E1b, E1c (as a table), E2 and its
+    diagnostics, DC1 and E5, the colocation systems of 2.10, the
+    offline predictor check of 6.27;
+  - the current design, with a proposal-vs-now table;
+  - implementation, with the screenshot figure;
+  - challenges;
+  - results so far (F's burst sweep as a table, the Azure medians,
+    the E12 and E15 ablations);
+  - remaining work.
+
+  Every number is taken from sections 6 and 7 of this log.
+- Files: `docs/report/progress/`, kept out of git at Aayush's choice
+  (like the proposal); `.gitignore` updated.
+- Build: Tectonic 0.17 (ARM64 binary from its GitHub release, in
+  `~/kairos-data/tools/`, no sudo; Aayush approved the download). It
+  is XeTeX-only. The style is written for pdflatex, so `progress.tex`
+  has lines that run only under XeTeX:
+  - `breakurl` is marked as loaded. Under pdflatex it disables itself;
+    under XeTeX it broke every `\url`.
+  - `microtype` is loaded first with protrusion, and the style's
+    `kerning,spacing` are marked as given. Those two are pdfTeX-only,
+    and microtype stops on them under XeTeX.
+
+  Under pdflatex (e.g. Overleaf) these lines do nothing.
+- Checked the screenshot recipe: `sudo ./scheduler/scx_kairos
+  --main-config --trace` and `trace_pipe` printed 147 `kairos enqueue`
+  lines in 2 s; then the scheduler was unloaded (`EXIT: unregistered
+  from user space`).
+
+**Found:** The PDF is 3 pages with a 1.6" placeholder for the
+screenshot, and about 2" of each column on page 3 is free. A pdflatex
+build should be no longer: microtype's pdfTeX-only features only
+tighten lines. That is a guess; no pdflatex build was made.
+
+**Interpretation:** none.
+
+**Decisions:** (Aayush) the report stays out of git; build with
+Tectonic.
+
+**Problems:**
+- The first Tectonic download was blocked by the permission check
+  until Aayush approved it.
+- The two XeTeX incompatibilities above.
+
+**Next:** Aayush takes the screenshot, which goes in as
+`docs/report/progress/callback.png`; rebuild and check the page count.
+Then the final report and the video.

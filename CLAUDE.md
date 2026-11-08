@@ -87,6 +87,9 @@ scripts/        helpers (log_entry.sh, meta.sh)
 - Statistical tests against a reference (Wilcoxon signed-rank paired by rep, Holm per metric, bootstrap CIs): `./analysis/stats.py results/<date>-<name> --ref kairos [pw1000r100] [--by burst|level] [--csv FILE]`
 - Figures for the report (F's data; needs matplotlib, e.g. in `~/kairos-data/venv`): `~/kairos-data/venv/bin/python analysis/plots.py [--png] [--refresh]` → `docs/report/figures/`
 - New log entry skeleton: `./scripts/log_entry.sh "<title>"`
+- Progress report (kept out of git): `cd docs/report/progress && ~/kairos-data/tools/tectonic progress.tex`
+  (Tectonic 0.17 is XeTeX; `progress.tex` has XeTeX-only lines for the USENIX style's
+  pdflatex packages; Overleaf/pdflatex builds it unchanged). Screenshot: `callback.png`
 
 ## Coding rules
 - BPF: keep loops bounded (`bpf_for`), null-check every map/task-storage lookup,

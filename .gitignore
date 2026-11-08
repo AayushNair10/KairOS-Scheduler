@@ -3,3 +3,7 @@ __pycache__/
 
 # Experiment data (18 GB by 2026-11-06): stays in the VM, not in git.
 results/
+
+# Progress report (LaTeX, PDF, screenshot): kept out of git like the proposal
+# (Aayush's choice, 2026-11-08). Build: see CLAUDE.md.
+docs/report/progress/
