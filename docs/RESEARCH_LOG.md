@@ -5796,3 +5796,35 @@ Tectonic.
 **Next:** Aayush takes the screenshot, which goes in as
 `docs/report/progress/callback.png`; rebuild and check the page count.
 Then the final report and the video.
+
+### 2026-11-08 — Progress report: screenshot added
+**Did:** Checked Aayush's screenshot (`~/Desktop/kairos-callback.png` on
+the Mac, 3060x1764). Copied it unchanged to
+`docs/report/progress/callback-full.png`. Cropped it with PIL to
+`callback.png`: the `trace_pipe` pane's first 8 text lines, which are 4
+whole entries (each wraps onto 2 lines). Rebuilt with Tectonic.
+
+**Found:**
+- **The screenshot is valid evidence.**
+  - Right pane: `bpf_trace_printk: kairos enqueue: pid=… comm=…
+    enq_flags=…` lines. These are printed only by kairos's `enqueue`
+    callback under `--trace`, for many tasks (cat, grep, tokio-runtime,
+    kworkers).
+  - Left pane: the loader's per-second counters (`local=… global=…`,
+    `split: lc_cpus …`), so the scheduler was loaded.
+  - It doesn't show the load command or `/sys/kernel/sched_ext/state`.
+    The requirement doesn't ask for them.
+- **At one column wide its text would be about 2–4 pt.** So Figure 1
+  is a full-width `figure*` of the crop: about 95 characters across
+  7", near 9 pt. The PDF is 3 pages, with about 1.3" free at the end
+  of page 3.
+
+**Interpretation:** none.
+
+**Decisions:** Crop to the trace pane, full width (legibility rule of the
+OSDI call).
+
+**Problems:** none.
+
+**Next:** Aayush reviews the PDF and submits; then the final report and
+the video.

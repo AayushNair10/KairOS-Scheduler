@@ -209,7 +209,7 @@ Method:
 | Deliverable | Due | Content | Status |
 |---|---|---|---|
 | Proposal (2 pages) | Fri Oct 30 | Motivation; design; evaluation plan; expected outcomes and challenges | |
-| Progress report (3 pages) | Fri Nov 13 | Design, **screenshot of own BPF callback output**, E1, early E2, remaining work | Draft builds to 3 pages (`docs/report/progress/`, kept out of git); needs the screenshot |
+| Progress report (3 pages) | Fri Nov 13 | Design, **screenshot of own BPF callback output**, E1, early E2, remaining work | Done: 3 pages with the screenshot (`docs/report/progress/progress.pdf`, kept out of git); Aayush to review and submit |
 | Video (≤ 5 min, Zoom) | Fri Dec 11 | Idea; workload; a live run showing latency | Not started |
 | Final report (5 pages) | Fri Dec 11 | Intro, background, design/impl, evaluation, discussion (why), conclusion; video link; repo with build/run instructions | Not started; README with build/run instructions done |
 
