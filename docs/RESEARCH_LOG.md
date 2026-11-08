@@ -5828,3 +5828,28 @@ OSDI call).
 
 **Next:** Aayush reviews the PDF and submits; then the final report and
 the video.
+
+### 2026-11-08 — Progress report: larger screenshot figure
+**Did:** At Aayush's request ("too small"), Figure 1 went from about
+1.0" to about 2.1" tall. It now has two crops of the same screenshot,
+both at full text width and the same scale:
+- the loader pane, one second of counters (6 lines);
+- the `trace_pipe` pane, 5 whole entries (10 lines).
+
+To keep 3 pages:
+- dropped the "second scheduler" (Go `GOMAXPROCS`) challenge; the Go
+  runtime point stays in section 2;
+- shortened the caption, the noise item and remaining work.
+
+**Found:**
+- The PDF is 3 pages, and page 3 is full.
+- The text size stays about 9 pt: the width is already the full 7"
+  text block, so only the height could grow.
+
+**Interpretation:** none.
+
+**Decisions:** none.
+
+**Problems:** none.
+
+**Next:** Aayush reviews and submits.
