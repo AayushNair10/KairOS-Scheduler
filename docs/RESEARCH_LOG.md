@@ -1134,6 +1134,7 @@ result directories and the rows below keep the labels they ran under
 | E5 | 2026-11-06 | de9a99f (tree dirty: RESEARCH_LOG.md only) | kairos-pw1000r100 (`--class=policy`), kairos-pw1000r100-classrun (`--class=run`: batch = ran 20 ms of CPU since it last slept) | `e5-class.conf` (E3's phases); started by hand at 07:40 after the host-speed check stopped it at 06:52 and 07:38 (`night4.sh` in the scratchpad), 07:40–08:36 | 10 | `results/2026-11-06-e5-class/` | No run flagged; server CPU per request 680–762 µs throughout. In rep 1 this Claude session used 8–12% of a CPU (log edits). `--class=run`: busy p50 +120%, busy >5 ms 12.7% → 38.6%, batch +7%, all p ≤ 0.006. The automatic rule doesn't match the labels (section 6.38) |
 | GR | 2026-11-07 | 02138b8 | offline, from G and G-nb's runs | `analysis/checks.py`: Redis CPU per completed GET, context switches per GET | 5, 3 | `results/2026-11-04-g-redis/`, `results/2026-11-04-g-redis-nobatch/` | Every run completed the same 658,954 GETs with no errors. Redis CPU per GET: kairos 2.6x eevdf with batch (24.4 vs 9.4 µs), 1.6x without (32.6 vs 20.2); with batch about 15–16 µs per preemption, but without batch kairos preempts nothing and still costs 12 µs more (section 6.39) |
 | E4 | 2026-11-07 | 02138b8 | offline, from F's burst sweep | `byburst.py`: latency by time since a burst started (bursts ≥ 1 s, `--min-length 1000`) and ended (all lengths) | 10 | `results/2026-11-05-final-burst/` | Every config is slower in the first 10 ms of a burst (10/10 reps; lavd 7–8/10): kairos ×1.9 (+0.8 ms), bpfland ×3.3, eevdf ×4.4 and settling only after 300 ms. After a burst eevdf, eevdfidle, kairos-never3 and lavd are 1.3–3.6x slower for 5–30 ms (10/10); kairos, kairos-pw1000r100 and bpfland not (section 6.40) |
+| LX | 2026-11-08 | 02138b8 | offline, from F's runs | `stats.py --ref eevdf --configs eevdf kairos pw1000r100`; CPU split of CPUs 0–2 (idle, server, rest) per run | 10 | `results/2026-11-05-final-burst/`, `results/2026-11-05-final-azure/` | kairos-pw1000r100 vs eevdf: burst busy p50 −68%, batch −1% (p = 0.32); Azure p50 −36%, batch +5% (Holm 0.039). On Azure it leaves less CPU idle (10/10) and the server uses less (8/10); on the burst sweep the server takes the freed CPU. 6.41 |
 
 ### 5.1 Planned experiments
 | # | Experiment | Pattern | Shows |
@@ -3038,6 +3039,67 @@ backlog match too.
 
   But that bin has only 13 requests per run.
 
+### 6.41 KairOS against Linux, and where the CPU time goes (offline, from F; 2026-11-08)
+From F's data (`results/2026-11-05-final-burst/`, `-azure/`), with no new
+runs. The tests are `analysis/stats.py DIR --ref eevdf --configs eevdf
+kairos pw1000r100` (Holm over the 2 comparisons per metric). The outputs
+are `stats-eevdf-burst.txt` and `stats-eevdf-azure.txt` in
+`~/kairos-data/scratchpad-2026-11-08/`.
+
+**Against eevdf (Linux's default)**, medians over 10 reps, paired by rep:
+
+| workload | metric | eevdf | kairos | kairos-pw1000r100 |
+|---|---|---|---|---|
+| burst | busy p50 (ms) | 4.11 | 1.10 (−74%, 10/10, Holm 0.004) | 1.41 (−68%, 10/10, Holm 0.004) |
+| burst | busy >5 ms (%) | 43.3 | 7.6 (−81%, 10/10) | 9.2 (−81%, 10/10) |
+| burst | quiet p50 (ms) | 1.26 | 0.87 (−31%, 10/10) | 0.94 (−27%, 10/10) |
+| burst | batch, whole load (MB/s) | 365 | 324 (−10%, 0/10, Holm 0.004) | 355 (−1%, 5/10, p = 0.32) |
+| Azure | p50 (ms) | 1.66 | 0.87 (−44%, 10/10) | 1.02 (−36%, 10/10) |
+| Azure | >5 ms (%) | 13.5 | 1.9 (−86%, 10/10) | 2.6 (−80%, 10/10) |
+| Azure | p99 (ms, descriptive) | 50.5 | 8.3 (−74%, 10/10) | 11.1 (−63%, 8/10, p = 0.32) |
+| Azure | batch (MB/s) | 452 | 456 (−3%, 3/10, p = 0.32) | 487 (+5%, 8/10, Holm 0.039) |
+
+Azure p50 by load level (<1000 / 1000–2000 / ≥2000 req/s): eevdf 1.38 /
+1.78 / 4.12 ms, kairos-pw1000r100 0.99 / 1.02 / 1.23, kairos 0.88 /
+0.86 / 0.90 (all 10/10).
+
+So kairos-pw1000r100 never loses to eevdf on a primary metric. Its
+batch matches eevdf's on the burst sweep and is 5% higher on the Azure
+replay.
+
+**Where the three service CPUs' time goes.** For each run, between
+run.sh's snapshots, all in CPUs:
+- *idle*: the summed idle share of CPUs 0–2, from `/proc/stat`;
+- *server*: grpcserver's CPU time (`runlib.proc_cpu`);
+- *rest*: 3 − idle − server. This is zstd plus the other processes on
+  CPUs 0–2 (the loader, kernel threads). zstd's own time can't be read
+  this way, because each pass is a new process that isn't in both
+  snapshots.
+
+The script is `cpu_split.py` (and an inline paired version) in
+`~/kairos-data/scratchpad-2026-11-08/`. Config medians:
+
+| workload | config | req/s | server | idle | rest | batch MB/s | ctx k/s | preempt/s |
+|---|---|---|---|---|---|---|---|---|
+| burst | eevdf | 1,859 | 1.25 | 0.31 | 1.44 | 365 | 40.8 | – |
+| burst | kairos | 1,859 | 1.35 | 0.33 | 1.32 | 324 | 49.3 | 7,414 |
+| burst | kairos-pw1000r100 | 1,859 | 1.29 | 0.30 | 1.41 | 355 | 35.5 | 735 |
+| Azure | eevdf | 847 | 0.69 | 0.46 | 1.85 | 452 | 36.1 | – |
+| Azure | kairos | 847 | 0.71 | 0.47 | 1.82 | 456 | 46.0 | 9,608 |
+| Azure | kairos-pw1000r100 | 847 | 0.66 | 0.42 | 1.92 | 487 | 29.4 | 730 |
+
+(bpfland, Azure: server 0.69, idle 0.38; lavd 0.69, 0.31; eevdfidle
+0.68, 0.57.)
+
+Paired by rep, minus eevdf (median, and how many reps were lower):
+
+| workload | config | idle | server | rest | batch MB/s |
+|---|---|---|---|---|---|
+| Azure | kairos-pw1000r100 | −0.039 (10/10 lower) | −0.021 (8/10) | +0.056 (0/10 lower) | +22 |
+| Azure | kairos | +0.012 (3/10) | +0.029 (2/10) | −0.039 (10/10) | −12 |
+| burst | kairos-pw1000r100 | −0.018 (8/10) | +0.037 (2/10) | −0.008 (6/10) | −5 |
+| burst | kairos | +0.011 (2/10) | +0.082 (0/10) | −0.093 (10/10) | −37 |
+
 ## 7. Explanations and insights
 (The "why" behind each result. This is what the report is graded on.)
 
@@ -3890,6 +3952,46 @@ Transitions (section 6.40):
   pool there are no switches to cause spikes. The transitions left are
   the load's own, and kairos handles both edges best of the configs
   measured.
+
+KairOS against Linux, and the Azure replay (section 6.41):
+- **On the Azure replay the machine is rarely full.**
+  - The service averages 847 req/s against 1,859 on the burst sweep,
+    and its server uses ~0.7 of the 3 CPUs against ~1.3.
+  - The two single-threaded zstd jobs can use at most 2 CPUs.
+  - So service and batch usually fit, and every config leaves 0.3–0.6
+    CPUs idle.
+  - Only hour 54 spends real time at 2000 req/s or more (16%, 6.17).
+- **The priority's cost shows only when the CPUs are full.**
+  - kairos-pw1000r100 leaves less CPU idle than eevdf on both workloads
+    (−0.04 Azure, −0.02 burst).
+  - On the burst sweep the server takes that and more (+0.04 CPU):
+    during bursts KairOS gives LC tasks the CPU first, by design. Batch
+    ends level with eevdf.
+  - On the Azure replay the server needs no extra CPU, and uses a little
+    less (−0.02). The freed time goes to batch (+0.06 CPU, +5% MB/s).
+- **Why less idle (guess, not measured directly).** KairOS's queues are
+  shared, so a CPU that frees up takes the next waiting task at once.
+  Linux keeps a run queue per CPU and moves waiting tasks to an idle CPU
+  only through idle/periodic balancing. A zstd job can sit queued on a
+  busy CPU while another idles. The design difference is fact; that it
+  explains the 0.02–0.04 CPU is a guess.
+- **Why less server CPU with the wait (guess).** The 1 ms wait keeps the
+  short Go runtime wakeups from preempting. That gives 730 preemptions/s
+  and 29k context switches/s, against eevdf's 36k. kairos, preempting at
+  once, makes ~9,600 preemptions/s and 46k context switches/s, and its
+  server uses more CPU than eevdf's (+0.03 Azure, +0.08 burst). That is
+  why kairos only ties eevdf on Azure batch and loses 10% on the burst
+  sweep. The link from context switches to server CPU fits Redis's
+  ~15 µs of server CPU per preemption (6.39), but wasn't measured for
+  grpcserver.
+- **Latency.** eevdf's Azure p50 rises with load (1.38 → 1.78 → 4.12
+  ms). kairos-pw1000r100 stays at 0.99–1.23 ms. Under EEVDF, zstd at
+  SCHED_BATCH keeps its full weight, so a woken server thread waits its
+  fair turn behind zstd when CPUs are busy. In KairOS an LC task waits
+  behind batch work for at most the 1 ms delay (it preempts a borrower
+  after that, or at once for longer runners).
+- **Limits.** One service, three trace hours and 3 CPUs. "rest" includes
+  other processes, not only zstd.
 
 ---
 
@@ -5736,3 +5838,32 @@ Each statement was checked against `scheduler/scx_kairos.bpf.c` and
 **Problems:** none.
 
 **Next:** progress report, final report, video.
+
+### 2026-11-08 — KairOS against Linux; where the CPU time goes (offline, F)
+**Did:**
+- Ran `analysis/stats.py --ref eevdf` on F's two workloads, to compare
+  kairos and kairos-pw1000r100 directly with Linux.
+- Split the service CPUs' time into idle, server and the rest, per run
+  (section 6.41).
+
+No new runs.
+
+**Found:** 6.41.
+- kairos-pw1000r100 against eevdf:
+  - busy p50 −68% and busy >5 ms −81% on the burst sweep, with batch
+    unchanged (−1%, p = 0.32);
+  - on the Azure replay, p50 −36% and batch +5% (Holm 0.039).
+- On Azure it leaves less CPU idle (10/10) and its server uses less CPU
+  (8/10). The difference goes to batch.
+
+**Interpretation:** section 7. The Azure load rarely fills the machine,
+so LC priority costs batch almost nothing there. On the burst sweep the
+server takes the CPU that KairOS frees.
+
+**Decisions:** (Aayush) keep this for the final report.
+
+**Problems:** zstd's own CPU time can't be read from the process
+snapshots (each pass is a new process), so "rest" includes other
+processes.
+
+**Next:** final report and video.
