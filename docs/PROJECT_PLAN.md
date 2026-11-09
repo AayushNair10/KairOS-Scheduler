@@ -125,9 +125,11 @@ The top comment describes every part. In short:
   (`batch/zstd_loop.sh`).
 
 ### ML (`ml/`, extension, closed)
-- `train_burst.py` trains a tree that predicts LC demand; the loader
+- `train_burst.py` trained a tree that predicts LC demand; the loader
   evaluates it (`--ml-model`).
 - `azure_predict.py`: offline predictors on the Azure trace.
+- Both scripts were removed on 2026-11-09, after ML closed, so that the
+  repository stays mostly C; they are in git history at ebe0e4e.
 - Result: equivalent to a bigger buffer on 3 CPUs (RESEARCH_LOG 6.13,
   6.26, 6.27).
 - The task classifier (E9) and the daemon were not built.

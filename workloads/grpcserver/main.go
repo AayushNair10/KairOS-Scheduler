@@ -35,7 +35,7 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 
-	pb "github.com/AayushNair10/KairOS/workloads/kairospb"
+	pb "github.com/AayushNair10/KairOS-Scheduler/workloads/kairospb"
 )
 
 var (

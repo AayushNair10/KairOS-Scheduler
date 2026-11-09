@@ -3,7 +3,7 @@
 Instructions for Claude when working in this repository.
 
 ## What this project is
-**KairOS** (repo: https://github.com/AayushNair10/KairOS; scheduler program
+**KairOS** (repo: https://github.com/AayushNair10/KairOS-Scheduler; scheduler program
 `scx_kairos`). Individual project by Aayush Nair: a Linux scheduler
 built with **sched_ext** (eBPF) that adapts **wakeup preemption** to current and
 predicted load, for a latency-critical service colocated with batch work.
@@ -51,7 +51,8 @@ Helper tooling (load generator, ML, analysis) may use Go or Python.
 ## Repository layout
 ```
 scheduler/      scx_kairos.bpf.c (policy), scx_kairos.c (loader/stats), Makefile
-ml/             collect.py, train_burst.py, train_classifier.py, daemon.py
+ml/             patterns.py (phase patterns), models/ (E8's tree; ML closed, its
+                scripts are in git history at ebe0e4e)
 workloads/      grpcserver/ (Go), loadgen/ (Go, open-loop), traces/
 experiments/    run.sh (harness), configs/
 analysis/       plots.py

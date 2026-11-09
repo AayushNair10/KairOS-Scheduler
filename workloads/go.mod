@@ -1,4 +1,4 @@
-module github.com/AayushNair10/KairOS/workloads
+module github.com/AayushNair10/KairOS-Scheduler/workloads
 
 go 1.26.8
 

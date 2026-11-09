@@ -39,7 +39,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/AayushNair10/KairOS/workloads/kairospb"
+	pb "github.com/AayushNair10/KairOS-Scheduler/workloads/kairospb"
 )
 
 var (

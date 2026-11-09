@@ -6,7 +6,7 @@
 # The generated kairospb/ files are committed, so a plain build needs only Go.
 
 GO     ?= go
-MODULE := github.com/AayushNair10/KairOS/workloads
+MODULE := github.com/AayushNair10/KairOS-Scheduler/workloads
 # protoc finds its plugins (protoc-gen-go, protoc-gen-go-grpc) on PATH.
 PLUGIN_DIR := $(shell $(GO) env GOPATH)/bin
 

@@ -97,7 +97,8 @@ const char help_fmt[] =
 "                          queue (off by default: no gain measured in E2k)\n"
 "      --no-kick-idle      the default; kept so older configs still run\n"
 "      --ml-trace FILE     every --ml-period-ms, write the LC demand sample\n"
-"                          (training data for ml/train_burst.py)\n"
+"                          (training data for ml/train_burst.py; removed\n"
+"                          after E8, it is in git history at ebe0e4e)\n"
 "      --ml-model FILE     predict LC demand with this tree (from\n"
 "                          ml/train_burst.py); the prediction can only grow\n"
 "                          the LC pool, and is ignored once stale\n"
@@ -481,6 +482,8 @@ static void write_diag(FILE *f, double t, const struct diag *cur, const struct d
  *   x[0] = d(t), x[1] = d(t - 1), ..., x[K-1] = d(t - K + 1), x[K] = ewma(t)
  * and predicts the largest sample of the next H periods. ml/train_burst.py
  * builds the same features from --ml-trace files; the two must agree.
+ * The script was removed when ML closed (E8); it is in git history at
+ * ebe0e4e.
  */
 #define ML_MAX_K	32
 #define ML_MAX_NODES	4096

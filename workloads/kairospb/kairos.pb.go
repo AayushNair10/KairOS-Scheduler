@@ -175,7 +175,7 @@ const file_kairos_proto_rawDesc = "" +
 	"recvUnixNs\x12\x17\n" +
 	"\awake_ns\x18\x05 \x01(\x04R\x06wakeNs24\n" +
 	"\x04Work\x12,\n" +
-	"\x02Do\x12\x13.kairos.WorkRequest\x1a\x11.kairos.WorkReplyB3Z1github.com/AayushNair10/KairOS/workloads/kairospbb\x06proto3"
+	"\x02Do\x12\x13.kairos.WorkRequest\x1a\x11.kairos.WorkReplyB=Z;github.com/AayushNair10/KairOS-Scheduler/workloads/kairospbb\x06proto3"
 
 var (
 	file_kairos_proto_rawDescOnce sync.Once

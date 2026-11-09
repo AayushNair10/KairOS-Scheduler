@@ -5,7 +5,7 @@ syntax = "proto3";
 
 package kairos;
 
-option go_package = "github.com/AayushNair10/KairOS/workloads/kairospb";
+option go_package = "github.com/AayushNair10/KairOS-Scheduler/workloads/kairospb";
 
 service Work {
   rpc Do(WorkRequest) returns (WorkReply);

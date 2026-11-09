@@ -5867,3 +5867,35 @@ snapshots (each pass is a new process), so "rest" includes other
 processes.
 
 **Next:** final report and video.
+
+### 2026-11-09 — Repository renamed; Python trimmed so GitHub shows C
+**Did:**
+- Aayush renamed the GitHub repository to
+  https://github.com/AayushNair10/KairOS-Scheduler. Updated `origin`,
+  CLAUDE.md and the Go module path (`go.mod`, the Makefile, imports,
+  `go_package`). Regenerated `kairospb/` with the same protoc 3.21.12
+  and plugins; only the path changed. `make -C workloads` builds.
+- Removed four Python scripts (23 KB). Each is closed or was used once,
+  and none is used by F:
+  - `ml/azure_predict.py` (AP, 6.27);
+  - `ml/train_burst.py` (MLte, 6.13);
+  - `analysis/split.py` (latency parts, section 4);
+  - `scripts/watch_runs.py` (run watcher).
+
+  All four are in git history at ebe0e4e. The loader's `--ml-model`
+  still reads `ml/models/burst-v1.txt`, and its help text points to that
+  commit.
+
+No new runs.
+
+**Found:** Tracked Python went from 114.5 KB to 91.3 KB; C (`.c` and
+`.h`) is 100.4 KB. GitHub's language bar counts bytes, so C should now
+lead. Not yet checked on GitHub.
+
+**Interpretation:** –
+
+**Decisions:** (Aayush) the repository should read as a C project.
+
+**Problems:** The margin is about 9 KB, so new Python can flip it back.
+
+**Next:** final report and video.
