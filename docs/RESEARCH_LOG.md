@@ -5853,3 +5853,25 @@ To keep 3 pages:
 **Problems:** none.
 
 **Next:** Aayush reviews and submits.
+
+### 2026-11-08 — Progress report: whole new screenshot
+**Did:** Aayush took a new screenshot (3104x810: loader on the left,
+`trace_pipe` on the right with unwrapped lines) and asked for all of
+it. It is in Figure 1 whole and unchanged, at full text width (about
+1.8" tall), as `docs/report/progress/callback.png`. The previous
+screenshot is kept as `callback-old.png`, and the crops made from it
+were deleted.
+
+**Found:**
+- The PDF is 3 pages.
+- About 215 characters span the 7" width, so the terminal text prints
+  at about 4 pt (estimate).
+
+**Interpretation:** none.
+
+**Decisions:** (Aayush) the whole image; Aayush will trim the text
+where needed.
+
+**Problems:** none.
+
+**Next:** Aayush edits and submits.
