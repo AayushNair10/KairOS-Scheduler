@@ -5875,3 +5875,29 @@ where needed.
 **Problems:** none.
 
 **Next:** Aayush edits and submits.
+
+### 2026-11-08 — Progress report rewritten for readability
+**Did:** Rewrote the progress report's text by Aayush's rules:
+- an abstract first, then an Introduction (no "Status" section);
+- no code identifiers;
+- "eBPF" instead of "sched_ext";
+- plain scheduler names (bpfland, LAVD, "KairOS, preempt at once" and
+  "KairOS, 1 ms wait");
+- short titles ("Early Findings" instead of "Why the Original Plan
+  Changed");
+- LATENCY and BATCH mode in capitals.
+
+Kept Aayush's own edit, "Stony Brook University" under the name. The
+numbers are unchanged from the earlier draft. The pre-rewrite file is in
+`~/kairos-data/scratchpad-2026-11-08/`. The rules are saved for the
+final paper.
+
+**Found:** The PDF is 3 pages.
+
+**Interpretation:** none.
+
+**Decisions:** (Aayush) these style rules for every written report.
+
+**Problems:** none.
+
+**Next:** Aayush trims and submits.
