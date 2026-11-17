@@ -5899,3 +5899,54 @@ lead. Not yet checked on GitHub.
 **Problems:** The margin is about 9 KB, so new Python can flip it back.
 
 **Next:** final report and video.
+
+### 2026-11-17 — Branch kairos-os: a quiet loader with an exit status
+**Commit:** 5a38f5f
+**Did:**
+- New branch `kairos-os`, for changes made for the Kairos OS (the
+  repository that includes this one as a submodule and starts the loader
+  from its init). `main` stays as evaluated.
+- Loader, `-q`/`--quiet`: no configuration line and no per-second stats on
+  stdout. `--stats` and `--diag` still write their files. Errors and the
+  exit reason still go to stderr.
+- Loader, exit status: says why it ended, for an init or a service manager
+  that has to decide whether to start it again.
+  - 0: unloaded on request (SIGINT or SIGTERM to the loader);
+  - 1: did not start (bad option, load or attach refused, or an output
+    file that can't be opened; the last gave 0 before);
+  - 3: the kernel unloaded it without an error (SysRq-S, or the kernel or
+    the policy asked);
+  - 4: the kernel unloaded it after an error;
+  - 5: the kernel's watchdog unloaded it (a runnable task waited too long).
+
+  Before, every unload gave 0. The kinds are read by name from the
+  running kernel (`__COMPAT_ENUM_OR_ZERO("scx_exit_kind", ...)`).
+- The policy (`scx_kairos.bpf.c`) is unchanged.
+
+No new runs.
+
+**Found:**
+- Tested on the VM's kernel (7.0.0-42): SIGTERM gives 0; `--lc-min x`
+  gives 1; a second loader while one is attached gives 1 ("Device or
+  resource busy"); SysRq-S gives 3 ("EXIT: disabled by sysrq-S"). 4 and 5
+  were not triggered; they differ from 3 only in the kind.
+- From the OS work, about the evaluation kernel: the kernel notices a
+  used-up slice on its tick (1000 a second there), and a task that starts
+  just after a tick has a few microseconds of a 3 ms slice left on the
+  third. Two busy LC tasks sharing one CPU under `--main-config` ran
+  4.0 ms at a time (1263 involuntary switches of one task in 10 s). The
+  numbers for other slices and tick rates are in the Kairos OS
+  repository, commit "Kernel: 1000 ticks a second".
+
+**Interpretation:** For LC tasks that use their whole slice back to back,
+`--lat-slice-us 3000` behaved as 4 ms in the evaluation. Tasks that sleep
+before the slice ends are not affected. Not checked: what this means for
+any result in section 6.
+
+**Decisions:** OS-only changes to the loader or the policy go on this
+branch.
+
+**Problems:** The branch isn't on GitHub yet.
+
+**Next:** Kairos's init starts the loader with `--main-config --quiet`
+and restarts it according to the exit status.

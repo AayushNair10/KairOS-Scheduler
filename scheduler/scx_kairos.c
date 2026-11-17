@@ -123,6 +123,8 @@ const char help_fmt[] =
 "      --slow-shift N      slow load EWMA weight 1/2^N per tick (default 6)\n"
 "\n"
 "Output and diagnostics:\n"
+"  -q, --quiet             don't print the configuration and the per-second\n"
+"                          stats (--stats and --diag still write their files)\n"
 "  -s, --stats FILE        also write the per-second stats to FILE as CSV\n"
 "      --diag FILE         count every wait for a CPU and every run, per task\n"
 "                          group, and write them per second to FILE as CSV\n"
@@ -132,7 +134,16 @@ const char help_fmt[] =
 "  -t, --trace             bpf_printk every enqueue (read trace_pipe)\n"
 "      --trace-class       bpf_printk every batch class change\n"
 "  -v, --verbose           print libbpf debug messages\n"
-"  -h, --help              display this help and exit\n";
+"  -h, --help              display this help and exit\n"
+"\n"
+"Exit status:\n"
+"  0  unloaded on request: a signal to this program (SIGINT or SIGTERM)\n"
+"  1  did not start: a bad option, or the kernel refused the scheduler\n"
+"  3  the kernel unloaded the scheduler without an error: SysRq-S, or the\n"
+"     kernel or the policy asked for it\n"
+"  4  the kernel unloaded the scheduler after an error\n"
+"  5  the kernel unloaded the scheduler because a runnable task waited too\n"
+"     long for a CPU (its watchdog)\n";
 
 /*
  * --main-config: the configuration the evaluation chose (RESEARCH_LOG
@@ -256,6 +267,7 @@ static const struct option long_opts[] = {
 	{ "victim",          required_argument, NULL, OPT_VICTIM },
 	{ "batch-min-run-us", required_argument, NULL, OPT_BATCH_MIN_RUN },
 	{ "trace-class",     no_argument,       NULL, OPT_TRACE_CLASS },
+	{ "quiet",           no_argument,       NULL, 'q' },
 	{ "stats",           required_argument, NULL, 's' },
 	{ "diag",            required_argument, NULL, OPT_DIAG },
 	{ "diag-comm",       required_argument, NULL, OPT_DIAG_COMM },
@@ -266,6 +278,7 @@ static const struct option long_opts[] = {
 };
 
 static bool verbose;
+static bool quiet;
 static volatile int exit_req;
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -273,6 +286,42 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 	if (level == LIBBPF_DEBUG && !verbose)
 		return 0;
 	return vfprintf(stderr, format, args);
+}
+
+/*
+ * Exit statuses, for whoever started this program and has to decide what to
+ * do when it ends (an init or a service manager). 1 is also what a bad
+ * option and a failed load or attach give (exit(1), SCX_BUG).
+ */
+enum {
+	EXIT_UNLOADED	= 0,	/* a signal to this program */
+	EXIT_NOT_STARTED = 1,
+	EXIT_KERNEL	= 3,	/* the kernel unloaded it, no error */
+	EXIT_ERROR	= 4,	/* ... after an error */
+	EXIT_STALL	= 5,	/* ... a runnable task waited too long */
+};
+
+/*
+ * Turn the kernel's reason for unloading the scheduler (enum scx_exit_kind,
+ * which ops.exit() stored in uei.kind) into an exit status.
+ *
+ * The kinds are read by name from the running kernel's type information
+ * rather than copied here as numbers. They are in order: the unloads that
+ * aren't errors first, then SCX_EXIT_ERROR and the kinds of error after it.
+ */
+static int exit_status(int kind)
+{
+	int unreg = __COMPAT_ENUM_OR_ZERO("scx_exit_kind", "SCX_EXIT_UNREG");
+	int error = __COMPAT_ENUM_OR_ZERO("scx_exit_kind", "SCX_EXIT_ERROR");
+	int stall = __COMPAT_ENUM_OR_ZERO("scx_exit_kind", "SCX_EXIT_ERROR_STALL");
+
+	if (kind == unreg)	/* this program closed the link */
+		return EXIT_UNLOADED;
+	if (kind == stall)
+		return EXIT_STALL;
+	if (kind >= error)
+		return EXIT_ERROR;
+	return EXIT_KERNEL;
 }
 
 static void sigint_handler(int sig)
@@ -631,6 +680,8 @@ int main(int argc, char **argv)
 	char diag_names[DIAG_GROUPS][DIAG_COMM_LEN] = {};
 	int opt;
 	__u64 ecode;
+	/* set where an output file can't be opened; else from the exit kind */
+	int status = EXIT_UNLOADED, kind;
 
 	argv = expand_main_config(&argc, argv);
 	libbpf_set_print(libbpf_print_fn);
@@ -640,7 +691,7 @@ restart:
 	optind = 1;
 	skel = SCX_OPS_OPEN(kairos_ops, scx_kairos);
 
-	while ((opt = getopt_long(argc, argv, "apns:tvh", long_opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "apnqs:tvh", long_opts, NULL)) != -1) {
 		switch (opt) {
 		case 'n':
 			skel->rodata->forced_mode = MODE_BATCH;
@@ -810,6 +861,9 @@ restart:
 				return 1;
 			}
 			break;
+		case 'q':
+			quiet = true;
+			break;
 		case 't':
 			skel->rodata->trace_enqueue = true;
 			break;
@@ -926,6 +980,7 @@ restart:
 		if (!csv) {
 			perror(stats_path);
 			exit_req = 1;
+			status = EXIT_NOT_STARTED;
 		} else {
 			fputs(csv_header, csv);
 		}
@@ -935,6 +990,7 @@ restart:
 		if (!ml.trace) {
 			perror(ml_trace_path);
 			exit_req = 1;
+			status = EXIT_NOT_STARTED;
 		} else {
 			fputs("t_ms,util,queued,demand,ewma,nr_lc,pred\n", ml.trace);
 		}
@@ -944,41 +1000,43 @@ restart:
 		if (!diag_csv) {
 			perror(diag_path);
 			exit_req = 1;
+			status = EXIT_NOT_STARTED;
 		} else {
 			write_diag_header(diag_csv);
 		}
 	}
-	printf("mode=%s lat_slice_us=%llu batch_slice_us=%llu timer_us=%llu "
-	       "fast_shift=%u slow_shift=%u victim=%s batch_min_run_us=%llu "
-	       "lat_target_us=%llu late_max=%.1f%% hold_ms=%llu-%llu signal_cpus=0x%llx "
-	       "split=%d split_cpus=0x%llx lc=%u-%u lc_buffer=%.2f lc_hyst=%.2f borrow_slice_us=%llu "
-	       "borrow_preempt=%d borrower_pick=%s preempt_wait_us=%llu preempt_min_run_us=%llu class=%s kick_idle=%d wake_sync=%d lc_queue=%s claim_borrower=%d max_wait_ms=%llu preempt_dep_us=%llu\n",
-	       skel->rodata->split ? "split" : skel->rodata->adaptive ? "adaptive" :
-	       skel->rodata->forced_mode == MODE_LATENCY ? "latency" : "batch",
-	       (unsigned long long)skel->rodata->lat_slice_ns / 1000,
-	       (unsigned long long)skel->rodata->batch_slice_ns / 1000,
-	       (unsigned long long)skel->rodata->timer_interval_ns / 1000,
-	       skel->rodata->fast_shift, skel->rodata->slow_shift,
-	       skel->rodata->victim_batch_only ? "batch" : "any",
-	       (unsigned long long)skel->rodata->batch_min_run_ns / 1000,
-	       (unsigned long long)skel->rodata->lat_target_ns / 1000,
-	       100.0 * skel->rodata->late_max / LATE_ONE,
-	       (unsigned long long)skel->rodata->hold_min_ns / 1000000,
-	       (unsigned long long)skel->rodata->hold_max_ns / 1000000,
-	       (unsigned long long)skel->rodata->signal_cpus,
-	       skel->rodata->split, split_mask, skel->rodata->lc_min, skel->rodata->lc_max,
-	       skel->rodata->lc_buffer / 1024.0, skel->rodata->lc_hyst / 1024.0,
-	       (unsigned long long)skel->rodata->borrow_slice_ns / 1000,
-	       skel->rodata->borrow_preempt,
-	       skel->rodata->borrower_pick == PICK_PREV ? "prev" :
-	       skel->rodata->borrower_pick == PICK_LONGEST ? "longest" : "first",
-	       (unsigned long long)skel->rodata->preempt_wait_ns / 1000,
-	       (unsigned long long)skel->rodata->preempt_min_run_ns / 1000,
-	       skel->rodata->class_policy ? "policy" : "run", skel->rodata->kick_idle,
-	       skel->rodata->wake_sync, skel->rodata->lc_percpu ? "percpu" : "shared",
-	       skel->rodata->claim_borrower,
-	       (unsigned long long)skel->rodata->max_wait_ns / 1000000,
-	       (unsigned long long)skel->rodata->preempt_dep_ns / 1000);
+	if (!quiet)
+		printf("mode=%s lat_slice_us=%llu batch_slice_us=%llu timer_us=%llu "
+		       "fast_shift=%u slow_shift=%u victim=%s batch_min_run_us=%llu "
+		       "lat_target_us=%llu late_max=%.1f%% hold_ms=%llu-%llu signal_cpus=0x%llx "
+		       "split=%d split_cpus=0x%llx lc=%u-%u lc_buffer=%.2f lc_hyst=%.2f borrow_slice_us=%llu "
+		       "borrow_preempt=%d borrower_pick=%s preempt_wait_us=%llu preempt_min_run_us=%llu class=%s kick_idle=%d wake_sync=%d lc_queue=%s claim_borrower=%d max_wait_ms=%llu preempt_dep_us=%llu\n",
+		       skel->rodata->split ? "split" : skel->rodata->adaptive ? "adaptive" :
+		       skel->rodata->forced_mode == MODE_LATENCY ? "latency" : "batch",
+		       (unsigned long long)skel->rodata->lat_slice_ns / 1000,
+		       (unsigned long long)skel->rodata->batch_slice_ns / 1000,
+		       (unsigned long long)skel->rodata->timer_interval_ns / 1000,
+		       skel->rodata->fast_shift, skel->rodata->slow_shift,
+		       skel->rodata->victim_batch_only ? "batch" : "any",
+		       (unsigned long long)skel->rodata->batch_min_run_ns / 1000,
+		       (unsigned long long)skel->rodata->lat_target_ns / 1000,
+		       100.0 * skel->rodata->late_max / LATE_ONE,
+		       (unsigned long long)skel->rodata->hold_min_ns / 1000000,
+		       (unsigned long long)skel->rodata->hold_max_ns / 1000000,
+		       (unsigned long long)skel->rodata->signal_cpus,
+		       skel->rodata->split, split_mask, skel->rodata->lc_min, skel->rodata->lc_max,
+		       skel->rodata->lc_buffer / 1024.0, skel->rodata->lc_hyst / 1024.0,
+		       (unsigned long long)skel->rodata->borrow_slice_ns / 1000,
+		       skel->rodata->borrow_preempt,
+		       skel->rodata->borrower_pick == PICK_PREV ? "prev" :
+		       skel->rodata->borrower_pick == PICK_LONGEST ? "longest" : "first",
+		       (unsigned long long)skel->rodata->preempt_wait_ns / 1000,
+		       (unsigned long long)skel->rodata->preempt_min_run_ns / 1000,
+		       skel->rodata->class_policy ? "policy" : "run", skel->rodata->kick_idle,
+		       skel->rodata->wake_sync, skel->rodata->lc_percpu ? "percpu" : "shared",
+		       skel->rodata->claim_borrower,
+		       (unsigned long long)skel->rodata->max_wait_ns / 1000000,
+		       (unsigned long long)skel->rodata->preempt_dep_ns / 1000);
 
 	__u64 prev[KAIROS_NR_STATS] = {};
 	struct diag diag_prev, diag_cur;
@@ -1063,27 +1121,29 @@ restart:
 			prev_pre_on[i] = n;
 		}
 
-		printf("local=%llu global=%llu preempt=%llu (batch %llu) no_victim=%llu "
-		       "class +%llu -%llu runnable=%lld (kernel %ld) load fast=%.2f slow=%.2f "
-		       "wakeups/s=%llu wait avg=%.0fus max=%.0fus kick=%llu\n",
-		       d[STAT_LOCAL], d[STAT_GLOBAL], d[STAT_PREEMPT], d[STAT_PREEMPT_BATCH],
-		       d[STAT_NO_VICTIM], d[STAT_TO_BATCH], d[STAT_FROM_BATCH],
-		       (long long)skel->bss->nr_runnable, procs_running(), fast, slow,
-		       (unsigned long long)skel->bss->wake_rate, wait_avg_us, wait_max_us,
-		       d[STAT_KICK]);
-		printf("  mode=%s late %llu/%llu (ewma %.1f%%) switches=%llu latency_ms=%.0f\n",
-		       skel->bss->mode == MODE_LATENCY ? "latency" : "batch",
-		       ll - prev_ll, lw - prev_lw, 100 * late_frac, sw - prev_sw, lat_ms);
-		if (skel->rodata->split)
-			printf("  split: lc_cpus now %u, avg %.2f, demand %.2f, changes %llu, borrow %llu "
-			       "delayed %llu late_preempt %llu\n",
-			       skel->bss->nr_lc, lc_cpus, lc_demand, lc_ch - prev_lc_ch,
-			       d[STAT_BORROW], d[STAT_DELAYED], d[STAT_LATE_PREEMPT]);
-		printf("  idle cpus %.2f (%.2f with a task queued) preempted per cpu %s sync %llu "
-		       "dup_pick %llu (alt %llu) overdue %llu dep %llu\n",
-		       idle_cpus, idle_queued, pre_cpus, d[STAT_SYNC], d[STAT_DUP_PICK],
-		       d[STAT_DUP_ALT], d[STAT_OVERDUE], d[STAT_DEP]);
-		fflush(stdout);
+		if (!quiet) {
+			printf("local=%llu global=%llu preempt=%llu (batch %llu) no_victim=%llu "
+			       "class +%llu -%llu runnable=%lld (kernel %ld) load fast=%.2f slow=%.2f "
+			       "wakeups/s=%llu wait avg=%.0fus max=%.0fus kick=%llu\n",
+			       d[STAT_LOCAL], d[STAT_GLOBAL], d[STAT_PREEMPT], d[STAT_PREEMPT_BATCH],
+			       d[STAT_NO_VICTIM], d[STAT_TO_BATCH], d[STAT_FROM_BATCH],
+			       (long long)skel->bss->nr_runnable, procs_running(), fast, slow,
+			       (unsigned long long)skel->bss->wake_rate, wait_avg_us, wait_max_us,
+			       d[STAT_KICK]);
+			printf("  mode=%s late %llu/%llu (ewma %.1f%%) switches=%llu latency_ms=%.0f\n",
+			       skel->bss->mode == MODE_LATENCY ? "latency" : "batch",
+			       ll - prev_ll, lw - prev_lw, 100 * late_frac, sw - prev_sw, lat_ms);
+			if (skel->rodata->split)
+				printf("  split: lc_cpus now %u, avg %.2f, demand %.2f, changes %llu, borrow %llu "
+				       "delayed %llu late_preempt %llu\n",
+				       skel->bss->nr_lc, lc_cpus, lc_demand, lc_ch - prev_lc_ch,
+				       d[STAT_BORROW], d[STAT_DELAYED], d[STAT_LATE_PREEMPT]);
+			printf("  idle cpus %.2f (%.2f with a task queued) preempted per cpu %s sync %llu "
+			       "dup_pick %llu (alt %llu) overdue %llu dep %llu\n",
+			       idle_cpus, idle_queued, pre_cpus, d[STAT_SYNC], d[STAT_DUP_PICK],
+			       d[STAT_DUP_ALT], d[STAT_OVERDUE], d[STAT_DEP]);
+			fflush(stdout);
+		}
 
 		if (csv) {
 			clock_gettime(CLOCK_REALTIME, &ts);
@@ -1126,6 +1186,7 @@ restart:
 
 	bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
+	kind = skel->data->uei.kind;	/* gone with the skeleton */
 	scx_kairos__destroy(skel);
 
 	if (UEI_ECODE_RESTART(ecode))
@@ -1136,5 +1197,5 @@ restart:
 		fclose(diag_csv);
 	if (ml.trace)
 		fclose(ml.trace);
-	return 0;
+	return status ? status : exit_status(kind);
 }
