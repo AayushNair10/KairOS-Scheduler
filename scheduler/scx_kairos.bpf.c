@@ -120,6 +120,24 @@ const volatile u64 signal_cpus = ~0ULL;
  */
 const volatile bool class_policy;
 /*
+ * With class_cgroup (--class=cgroup, for the Kairos OS): batch = the task
+ * is in the control group whose id is batch_cgid, or in a group below it,
+ * or has the SCHED_BATCH or SCHED_IDLE policy. So a task can lower its own
+ * class but not raise it out of the batch group.
+ *
+ * The group is the scheduler's view of the task's group: the nearest one,
+ * going up, that the CPU controller applies to. The kernel passes it to
+ * init_task() when a task is created (or when this scheduler is loaded)
+ * and to cgroup_move() when a task moves; the answer is kept in the task's
+ * context, so a wakeup costs no more than with class_policy.
+ *
+ * batch_level is the batch group's depth in the tree (the root is 0),
+ * found from its id in kairos_init().
+ */
+const volatile bool class_cgroup;
+const volatile u64 batch_cgid;
+static int batch_level;
+/*
  * Soft CPU split (--split). split_rank[cpu] is the CPU's position among the
  * split CPUs (-1: not in the split; such CPUs act as LC CPUs). The first
  * nr_lc split CPUs are LC CPUs. nr_lc stays within [lc_min, lc_max]; the
@@ -318,6 +336,7 @@ struct task_ctx {
 	u8 group;		/* diagnostics group, set in running() */
 	u8 preempted_in;	/* --diag: its next run starts by preempting */
 	u8 delayed;		/* waits in LC_DSQ for preempt_wait_ns (STAT_DELAYED) */
+	u8 in_batch_cgroup;	/* --class=cgroup: in the batch group or below */
 	u64 avg_run;		/* EWMA of CPU time from waking to sleeping */
 	u64 woke_lc_at;		/* --preempt-dep-us: when it last woke an LC task */
 };
@@ -408,12 +427,59 @@ static bool is_batch(u64 run_since_sleep)
 	return run_since_sleep >= batch_min_run_ns;
 }
 
-/* @p's class now: by policy with class_policy, else by the run-time rule. */
+static bool policy_batch(const struct task_struct *p)
+{
+	return p->policy == SCHED_BATCH || p->policy == SCHED_IDLE;
+}
+
+/*
+ * @p's class now: by group with class_cgroup, by policy with class_policy,
+ * else by the run-time rule.
+ */
 static bool task_batch(const struct task_struct *p, const struct task_ctx *tctx)
 {
+	if (class_cgroup)
+		return (tctx && tctx->in_batch_cgroup) || policy_batch(p);
 	if (class_policy)
-		return p->policy == SCHED_BATCH || p->policy == SCHED_IDLE;
+		return policy_batch(p);
 	return tctx && is_batch(tctx->run_since_sleep);
+}
+
+/*
+ * --class=cgroup: is @cgrp the batch group or below it? Its ancestor at
+ * the batch group's depth is the batch group itself if so.
+ *
+ * Verifier: bpf_cgroup_ancestor() takes only a trusted pointer (an
+ * argument of the callback, or a reference the program holds). A pointer
+ * read from a field of an argument isn't one ("R1 must be a rcu pointer"
+ * for init_task()'s args->cgroup), so cgroup_id_in_batch() first takes a
+ * reference by the group's id.
+ */
+static bool cgroup_in_batch(struct cgroup *cgrp)
+{
+	struct cgroup *anc;
+	bool in;
+
+	if (cgrp->level < batch_level)
+		return false;
+	anc = bpf_cgroup_ancestor(cgrp, batch_level);
+	if (!anc)
+		return false;
+	in = anc->kn->id == batch_cgid;
+	bpf_cgroup_release(anc);
+	return in;
+}
+
+static bool cgroup_id_in_batch(u64 cgid)
+{
+	struct cgroup *cgrp = bpf_cgroup_from_id(cgid);
+	bool in;
+
+	if (!cgrp)
+		return false;
+	in = cgroup_in_batch(cgrp);
+	bpf_cgroup_release(cgrp);
+	return in;
 }
 
 /*
@@ -1261,10 +1327,29 @@ void BPF_STRUCT_OPS(kairos_enable, struct task_struct *p)
 s32 BPF_STRUCT_OPS(kairos_init_task, struct task_struct *p,
 		   struct scx_init_task_args *args)
 {
+	struct task_ctx *tctx;
+
 	/* zero-filled: not batch until it has run batch_min_run_ns */
-	if (!bpf_task_storage_get(&task_ctxs, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE))
+	tctx = bpf_task_storage_get(&task_ctxs, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!tctx)
 		return -ENOMEM;
+	/* a plain read through args->cgroup: allowed, and 0 if it is NULL */
+	if (class_cgroup)
+		tctx->in_batch_cgroup = cgroup_id_in_batch(args->cgroup->kn->id);
 	return 0;
+}
+
+/* --class=cgroup: @p moved to another group; its class may have changed. */
+void BPF_STRUCT_OPS(kairos_cgroup_move, struct task_struct *p,
+		    struct cgroup *from, struct cgroup *to)
+{
+	struct task_ctx *tctx;
+
+	if (!class_cgroup)
+		return;
+	tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
+	if (tctx)
+		tctx->in_batch_cgroup = cgroup_in_batch(to);
 }
 
 static u64 last_tick_at, last_wakeups, last_wait_sum, last_wait_cnt;
@@ -1557,6 +1642,17 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(kairos_init)
 		scx_bpf_error("%u CPUs, at most %d supported", nr_cpus, KAIROS_MAX_CPUS);
 		return -E2BIG;
 	}
+	if (class_cgroup) {
+		struct cgroup *batch = bpf_cgroup_from_id(batch_cgid);
+
+		if (!batch) {
+			scx_bpf_error("no control group with id %llu", batch_cgid);
+			return -ENOENT;
+		}
+		batch_level = batch->level;
+		bpf_cgroup_release(batch);
+	}
+
 	/* adaptive starts in LATENCY mode, the safe one for latency */
 	mode = adaptive ? MODE_LATENCY : forced_mode;
 	hold_ns = hold_min_ns;
@@ -1616,6 +1712,7 @@ SCX_OPS_DEFINE(kairos_ops,
 	       .quiescent		= (void *)kairos_quiescent,
 	       .enable			= (void *)kairos_enable,
 	       .init_task		= (void *)kairos_init_task,
+	       .cgroup_move		= (void *)kairos_cgroup_move,
 	       .init			= (void *)kairos_init,
 	       .exit			= (void *)kairos_exit,
 	       .name			= "kairos");

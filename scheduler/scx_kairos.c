@@ -15,6 +15,10 @@
 #include <getopt.h>
 #include <libgen.h>
 #include <time.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
+#include <linux/magic.h>
 #include <bpf/bpf.h>
 #include <scx/common.h>
 #include "scx_kairos.h"
@@ -62,9 +66,13 @@ const char help_fmt[] =
 "                          task before its own queue's once that task has\n"
 "                          waited N ms (default 0: off; the kernel unloads the\n"
 "                          scheduler after a 30 s wait)\n"
-"      --class run|policy  batch = ran --batch-min-run-us since it slept (run),\n"
-"                          or has policy SCHED_BATCH/SCHED_IDLE (policy)\n"
+"      --class run|policy|cgroup  batch = ran --batch-min-run-us since it\n"
+"                          slept (run), or has policy SCHED_BATCH/SCHED_IDLE\n"
+"                          (policy), or is in the --batch-cgroup group or\n"
+"                          below it or has one of those policies (cgroup)\n"
 "                          (default run; E5 found policy much better)\n"
+"      --batch-cgroup PATH  --class=cgroup: the batch group, a folder in the\n"
+"                          control-group (version 2) file system\n"
 "      --batch-min-run-us N  --class=run: a task is batch once it has run N us\n"
 "                          of CPU since it last slept (default 20000)\n"
 "\n"
@@ -222,6 +230,7 @@ enum {
 	OPT_ML_PERIOD,
 	OPT_ML_TTL,
 	OPT_CLASS,
+	OPT_BATCH_CGROUP,
 };
 
 static const struct option long_opts[] = {
@@ -264,6 +273,7 @@ static const struct option long_opts[] = {
 	{ "ml-period-ms",    required_argument, NULL, OPT_ML_PERIOD },
 	{ "ml-ttl-ms",       required_argument, NULL, OPT_ML_TTL },
 	{ "class",           required_argument, NULL, OPT_CLASS },
+	{ "batch-cgroup",    required_argument, NULL, OPT_BATCH_CGROUP },
 	{ "victim",          required_argument, NULL, OPT_VICTIM },
 	{ "batch-min-run-us", required_argument, NULL, OPT_BATCH_MIN_RUN },
 	{ "trace-class",     no_argument,       NULL, OPT_TRACE_CLASS },
@@ -340,6 +350,30 @@ static unsigned long long parse_num(const char *name, const char *s)
 		exit(1);
 	}
 	return v;
+}
+
+/*
+ * --batch-cgroup: the id of the control group at @path, which the policy
+ * compares groups against. A group's id is the inode number of its folder
+ * (on a 64-bit machine; kernfs_id_ino() in the kernel). Returns 0, or says
+ * why not and returns -1.
+ */
+static int batch_cgroup_id(const char *path, u64 *id)
+{
+	struct statfs fs;
+	struct stat st;
+
+	if (statfs(path, &fs) || stat(path, &st)) {
+		fprintf(stderr, "--batch-cgroup %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	if (fs.f_type != CGROUP2_SUPER_MAGIC || !S_ISDIR(st.st_mode)) {
+		fprintf(stderr, "--batch-cgroup %s: not a folder of the control-group "
+			"(version 2) file system\n", path);
+		return -1;
+	}
+	*id = st.st_ino;
+	return 0;
 }
 
 /* Parse a CPU list such as "0-2" or "0,2-3" into a bitmask, or exit. */
@@ -852,14 +886,17 @@ restart:
 			skel->rodata->borrow_slice_ns = parse_num("borrow-slice-us", optarg) * 1000;
 			break;
 		case OPT_CLASS:
-			if (!strcmp(optarg, "run")) {
-				skel->rodata->class_policy = false;
-			} else if (!strcmp(optarg, "policy")) {
-				skel->rodata->class_policy = true;
-			} else {
-				fprintf(stderr, "--class must be 'run' or 'policy'\n");
+			skel->rodata->class_policy = !strcmp(optarg, "policy");
+			skel->rodata->class_cgroup = !strcmp(optarg, "cgroup");
+			if (strcmp(optarg, "run") && !skel->rodata->class_policy &&
+			    !skel->rodata->class_cgroup) {
+				fprintf(stderr, "--class must be 'run', 'policy' or 'cgroup'\n");
 				return 1;
 			}
+			break;
+		case OPT_BATCH_CGROUP:
+			if (batch_cgroup_id(optarg, &skel->rodata->batch_cgid))
+				return 1;
 			break;
 		case 'q':
 			quiet = true;
@@ -970,6 +1007,10 @@ restart:
 			fprintf(stderr, "--preempt-dep-us needs --preempt-wait-us\n");
 			return 1;
 		}
+		if (skel->rodata->class_cgroup != !!skel->rodata->batch_cgid) {
+			fprintf(stderr, "--class=cgroup and --batch-cgroup go together\n");
+			return 1;
+		}
 	}
 
 	SCX_OPS_LOAD(skel, kairos_ops, scx_kairos, uei);
@@ -1032,6 +1073,7 @@ restart:
 		       skel->rodata->borrower_pick == PICK_LONGEST ? "longest" : "first",
 		       (unsigned long long)skel->rodata->preempt_wait_ns / 1000,
 		       (unsigned long long)skel->rodata->preempt_min_run_ns / 1000,
+		       skel->rodata->class_cgroup ? "cgroup" :
 		       skel->rodata->class_policy ? "policy" : "run", skel->rodata->kick_idle,
 		       skel->rodata->wake_sync, skel->rodata->lc_percpu ? "percpu" : "shared",
 		       skel->rodata->claim_borrower,

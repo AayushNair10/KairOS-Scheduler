@@ -1056,6 +1056,33 @@ choices. Add as you go.)
 - **`--help` regrouped** (same commit): the main configuration; the
   split; slices and timing; options for experiments and ablations only,
   each marked with its experiment; the first design's modes; output.
+- **`--class=cgroup` (2026-11-20, branch `kairos-os` only).** For the
+  Kairos OS, whose service manager puts each service in a control group
+  under one for its class. Batch = in the group `--batch-cgroup PATH`
+  names or below it, or policy `SCHED_BATCH`/`SCHED_IDLE` (a task can
+  lower itself, not raise itself). `--main-config` is unchanged; Kairos
+  adds the two options after it.
+  - **Which group.** The scheduler's view of a task's group: the nearest
+    one, going up, that the cgroup v2 CPU controller applies to
+    (`p->sched_task_group`). The kernel passes it to `ops.init_task()`
+    (`args->cgroup`, with `CONFIG_EXT_GROUP_SCHED`; at fork and for every
+    task when the scheduler is loaded) and to `ops.cgroup_move()`. The
+    answer is kept in `task_ctx.in_batch_cgroup`, so `task_batch()` costs
+    no more than with `--class=policy`.
+  - **The id.** The loader passes the group's id: the inode number of its
+    folder (equal on 64-bit, `kernfs_id_ino()`), after checking with
+    `statfs()` that the folder is on cgroup2 (`CGROUP2_SUPER_MAGIC`).
+    `kairos_init()` looks the group up with `bpf_cgroup_from_id()` and
+    keeps its depth; a task's group is in batch if its ancestor at that
+    depth (`bpf_cgroup_ancestor()`) has the batch group's id.
+  - **Verifier.** `bpf_cgroup_ancestor()` is `KF_RCU`: it takes only a
+    trusted pointer. `cgroup_move()`'s `to` is one (a callback argument);
+    `init_task()`'s `args->cgroup` isn't (a pointer read from a field of an
+    argument): "R1 must be a rcu pointer". So `init_task()` reads
+    `args->cgroup->kn->id` (plain loads through an untrusted pointer are
+    allowed) and takes a reference with `bpf_cgroup_from_id()` first.
+  - Not used: `scx_bpf_task_cgroup()`, which is allowed only in callbacks
+    that hold the task's run-queue lock; `init_task()` doesn't.
 
 ---
 
@@ -5950,3 +5977,43 @@ branch.
 
 **Next:** Kairos's init starts the loader with `--main-config --quiet`
 and restarts it according to the exit status.
+
+### 2026-11-20 — Branch kairos-os: class by control group
+**Did:**
+- `--class=cgroup` and `--batch-cgroup PATH` (section 4): batch = in
+  that control group or below it, or policy `SCHED_BATCH`/`SCHED_IDLE`.
+  The policy implements `ops.cgroup_move()` and fills the new field
+  `task_ctx.in_batch_cgroup` in `ops.init_task()`.
+- `--class=run` and `--class=policy` and `--main-config` are unchanged.
+
+No new runs.
+
+**Found:**
+- First load refused by the verifier: `bpf_cgroup_ancestor()` on
+  `args->cgroup` in `init_task()`, "R1 must be a rcu pointer"; fixed by
+  taking a reference by id first (section 4).
+- Tested on the Kairos kernel in QEMU (4 CPUs, Kairos's control groups,
+  loader started by hand with `--main-config --class=cgroup
+  --batch-cgroup=/sys/fs/cgroup/batch --stats`), with 4 busy loops,
+  per-second values of `nr_lc` and `borrow` from the stats CSV:
+  - loops in the root group: 4 LC CPUs, 0 borrows;
+  - moved into the batch group: 2 LC CPUs, 2 borrows a second;
+  - moved back: 4 LC CPUs again, 0 borrows;
+  - started in the batch group before the scheduler was loaded: 2 LC
+    CPUs, 2 to 3 borrows a second (the `init_task()` path).
+- The loader errors: `--class=cgroup` without `--batch-cgroup`, and a
+  folder that isn't on cgroup2, each give status 1.
+- Builds against the VM's kernel tree too (`~/linux-src`). Not loaded on
+  the VM.
+
+**Interpretation:** The class follows a task into and out of the batch
+group, and the LC pool follows the class. The policy half of the rule
+(a task lowering itself) wasn't tried: the Kairos image has no `chrt`.
+
+**Decisions:** None beyond section 4.
+
+**Problems:** The branch isn't on GitHub yet.
+
+**Next:** Kairos's init passes `--class=cgroup
+--batch-cgroup=/sys/fs/cgroup/batch`; its service manager starts each
+service in a group under `lc` or `batch`.
