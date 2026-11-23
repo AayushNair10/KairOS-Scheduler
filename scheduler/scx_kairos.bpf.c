@@ -433,6 +433,16 @@ static bool policy_batch(const struct task_struct *p)
 }
 
 /*
+ * By the run-time rule (--class=run), a task's class can change while it
+ * runs, so it is judged with what it has run so far. By every other rule it
+ * stays as it was when the task started running (cpu_ctx.batch).
+ */
+static bool class_by_run(void)
+{
+	return !class_policy && !class_cgroup;
+}
+
+/*
  * @p's class now: by group with class_cgroup, by policy with class_policy,
  * else by the run-time rule.
  */
@@ -560,7 +570,7 @@ static s32 pick_victim(struct task_struct *p, u64 vtime, bool *batch)
 			continue;
 		/* what it has run since it started on this CPU */
 		ran = time_after(now, cctx->running_at) ? now - cctx->running_at : 0;
-		b = class_policy ? cctx->batch : is_batch(cctx->run_since_sleep + ran);
+		b = class_by_run() ? is_batch(cctx->run_since_sleep + ran) : cctx->batch;
 		if (victim_batch_only && !b)
 			continue;
 		cur = cctx->vtime + ran * 100 / cctx->weight;
