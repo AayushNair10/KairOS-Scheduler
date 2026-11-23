@@ -138,6 +138,31 @@ const volatile bool class_cgroup;
 const volatile u64 batch_cgid;
 static int batch_level;
 /*
+ * With class_kernel (--class=kernel, for the Kairos OS): batch = the
+ * kernel's class for the task is batch, or it has the SCHED_BATCH or
+ * SCHED_IDLE policy. Kairos's kernel keeps a class for every control group
+ * (the kairos controller: kairos.class) and tells it with
+ * bpf_kairos_task_class(). It is asked at each decision, so a change to a
+ * group's class applies from each task's next decision, without a
+ * callback.
+ *
+ * Not in init_task() or enable(): fork moves a new task into its group
+ * only after both, so until then the kernel answers with the root group's
+ * class.
+ *
+ * The function exists only in Kairos's kernel. __weak lets this program
+ * load without it; bpf_ksym_exists() is then false and the verifier drops
+ * the call. Its result is the kernel's enum kairos_class. libbpf accepts
+ * any enum where the kernel has one, so a copy of the numbers here lets
+ * this file compile against any kernel's vmlinux.h.
+ */
+const volatile bool class_kernel;
+enum kairos_os_class {
+	KAIROS_OS_CLASS_LC	= 0,
+	KAIROS_OS_CLASS_BATCH	= 1,
+};
+enum kairos_os_class bpf_kairos_task_class(struct task_struct *p) __ksym __weak;
+/*
  * Soft CPU split (--split). split_rank[cpu] is the CPU's position among the
  * split CPUs (-1: not in the split; such CPUs act as LC CPUs). The first
  * nr_lc split CPUs are LC CPUs. nr_lc stays within [lc_min, lc_max]; the
@@ -439,15 +464,29 @@ static bool policy_batch(const struct task_struct *p)
  */
 static bool class_by_run(void)
 {
-	return !class_policy && !class_cgroup;
+	return !class_policy && !class_cgroup && !class_kernel;
 }
 
 /*
- * @p's class now: by group with class_cgroup, by policy with class_policy,
- * else by the run-time rule.
+ * --class=kernel: the kernel's class for @p. The cast drops const only for
+ * the C compiler; the verifier checks that @p is a trusted pointer, which
+ * the task a callback receives is.
+ */
+static bool kernel_batch(const struct task_struct *p)
+{
+	if (!bpf_ksym_exists(bpf_kairos_task_class))
+		return false;
+	return bpf_kairos_task_class((struct task_struct *)p) == KAIROS_OS_CLASS_BATCH;
+}
+
+/*
+ * @p's class now: from the kernel with class_kernel, by group with
+ * class_cgroup, by policy with class_policy, else by the run-time rule.
  */
 static bool task_batch(const struct task_struct *p, const struct task_ctx *tctx)
 {
+	if (class_kernel)
+		return kernel_batch(p) || policy_batch(p);
 	if (class_cgroup)
 		return (tctx && tctx->in_batch_cgroup) || policy_batch(p);
 	if (class_policy)
@@ -1661,6 +1700,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(kairos_init)
 		}
 		batch_level = batch->level;
 		bpf_cgroup_release(batch);
+	}
+	/* the loader checks this too; a program loaded another way may not */
+	if (class_kernel && !bpf_ksym_exists(bpf_kairos_task_class)) {
+		scx_bpf_error("--class=kernel: this kernel has no bpf_kairos_task_class()");
+		return -ENOENT;
 	}
 
 	/* adaptive starts in LATENCY mode, the safe one for latency */

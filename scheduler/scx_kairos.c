@@ -20,6 +20,7 @@
 #include <sys/statfs.h>
 #include <linux/magic.h>
 #include <bpf/bpf.h>
+#include <bpf/btf.h>
 #include <scx/common.h>
 #include "scx_kairos.h"
 #include "scx_kairos.bpf.skel.h"
@@ -66,10 +67,13 @@ const char help_fmt[] =
 "                          task before its own queue's once that task has\n"
 "                          waited N ms (default 0: off; the kernel unloads the\n"
 "                          scheduler after a 30 s wait)\n"
-"      --class run|policy|cgroup  batch = ran --batch-min-run-us since it\n"
-"                          slept (run), or has policy SCHED_BATCH/SCHED_IDLE\n"
-"                          (policy), or is in the --batch-cgroup group or\n"
-"                          below it or has one of those policies (cgroup)\n"
+"      --class run|policy|cgroup|kernel  batch = ran --batch-min-run-us\n"
+"                          since it slept (run), or has policy\n"
+"                          SCHED_BATCH/SCHED_IDLE (policy), or is in the\n"
+"                          --batch-cgroup group or below it or has one of\n"
+"                          those policies (cgroup), or the kernel's class for\n"
+"                          it (Kairos's kernel: kairos.class) is batch or it\n"
+"                          has one of those policies (kernel)\n"
 "                          (default run; E5 found policy much better)\n"
 "      --batch-cgroup PATH  --class=cgroup: the batch group, a folder in the\n"
 "                          control-group (version 2) file system\n"
@@ -374,6 +378,24 @@ static int batch_cgroup_id(const char *path, u64 *id)
 	}
 	*id = st.st_ino;
 	return 0;
+}
+
+/*
+ * --class=kernel: does the running kernel have bpf_kairos_task_class()?
+ * Its type information (/sys/kernel/btf/vmlinux) lists every function a BPF
+ * program may call. The policy would load without it (it declares it
+ * __weak) and then fail at once; this says why before trying.
+ */
+static bool kernel_has_class(void)
+{
+	struct btf *btf = btf__load_vmlinux_btf();
+	bool has;
+
+	if (!btf)
+		return false;
+	has = btf__find_by_name_kind(btf, "bpf_kairos_task_class", BTF_KIND_FUNC) > 0;
+	btf__free(btf);
+	return has;
 }
 
 /* Parse a CPU list such as "0-2" or "0,2-3" into a bitmask, or exit. */
@@ -888,9 +910,10 @@ restart:
 		case OPT_CLASS:
 			skel->rodata->class_policy = !strcmp(optarg, "policy");
 			skel->rodata->class_cgroup = !strcmp(optarg, "cgroup");
+			skel->rodata->class_kernel = !strcmp(optarg, "kernel");
 			if (strcmp(optarg, "run") && !skel->rodata->class_policy &&
-			    !skel->rodata->class_cgroup) {
-				fprintf(stderr, "--class must be 'run', 'policy' or 'cgroup'\n");
+			    !skel->rodata->class_cgroup && !skel->rodata->class_kernel) {
+				fprintf(stderr, "--class must be 'run', 'policy', 'cgroup' or 'kernel'\n");
 				return 1;
 			}
 			break;
@@ -1011,6 +1034,11 @@ restart:
 			fprintf(stderr, "--class=cgroup and --batch-cgroup go together\n");
 			return 1;
 		}
+		if (skel->rodata->class_kernel && !kernel_has_class()) {
+			fprintf(stderr, "--class=kernel: this kernel can't tell a task's class "
+				"(it has no bpf_kairos_task_class(); Kairos's kernel has)\n");
+			return 1;
+		}
 	}
 
 	SCX_OPS_LOAD(skel, kairos_ops, scx_kairos, uei);
@@ -1073,6 +1101,7 @@ restart:
 		       skel->rodata->borrower_pick == PICK_LONGEST ? "longest" : "first",
 		       (unsigned long long)skel->rodata->preempt_wait_ns / 1000,
 		       (unsigned long long)skel->rodata->preempt_min_run_ns / 1000,
+		       skel->rodata->class_kernel ? "kernel" :
 		       skel->rodata->class_cgroup ? "cgroup" :
 		       skel->rodata->class_policy ? "policy" : "run", skel->rodata->kick_idle,
 		       skel->rodata->wake_sync, skel->rodata->lc_percpu ? "percpu" : "shared",

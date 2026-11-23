@@ -1083,6 +1083,36 @@ choices. Add as you go.)
     allowed) and takes a reference with `bpf_cgroup_from_id()` first.
   - Not used: `scx_bpf_task_cgroup()`, which is allowed only in callbacks
     that hold the task's run-queue lock; `init_task()` doesn't.
+- **`--class=kernel` (2026-11-23, branch `kairos-os` only).** Batch = the
+  kernel's class for the task is batch, or policy `SCHED_BATCH`/
+  `SCHED_IDLE`. The Kairos OS kernel keeps a class for every control
+  group (its own cgroup controller, `kairos.class`, inherited by the
+  groups below) and exports `enum kairos_class
+  bpf_kairos_task_class(struct task_struct *)` to struct_ops programs
+  (0 = LC, 1 = batch).
+  - **Asked at each decision**, in `task_batch()`: no note in `task_ctx`,
+    no `init_task()` or `cgroup_move()` work, and a write to a group's
+    class applies from each task's next decision. The kfunc follows the
+    task's css_set under RCU: a few loads.
+  - **Not in `init_task()` or `enable()`.** Fork moves a new task into
+    its group (`cgroup_post_fork()`) after `sched_cgroup_fork()` and
+    `sched_post_fork()`, which call them; until then the task points at
+    `init_css_set`, and the answer is the root's, LC.
+  - **Loads without it.** Declared `__ksym __weak`; `kernel_batch()` is
+    guarded by `bpf_ksym_exists()`, so on another kernel the verifier
+    drops the call. libbpf matches an extern's return type by kind only
+    (any enum matches any enum, `__bpf_core_types_are_compat()`), so a
+    local `enum kairos_os_class` with the same numbers stands in for the
+    kernel's and the file compiles against any `vmlinux.h`. The loader
+    refuses `--class=kernel` when `/sys/kernel/btf/vmlinux` has no such
+    function (`btf__find_by_name_kind()`), and `kairos_init()` errors out
+    too, for a program loaded another way.
+- **`pick_victim()` fixed (same day).** It judged a running task's class
+  by the run-time rule unless `--class=policy`, so under `--class=cgroup`
+  it ignored the group. Now only `--class=run` is judged live
+  (`class_by_run()`); every other rule uses `cpu_ctx.batch`, noted when
+  the task started running. Only reached without `--split`, which the
+  Kairos OS always uses.
 
 ---
 
@@ -6017,3 +6047,43 @@ group, and the LC pool follows the class. The policy half of the rule
 **Next:** Kairos's init passes `--class=cgroup
 --batch-cgroup=/sys/fs/cgroup/batch`; its service manager starts each
 service in a group under `lc` or `batch`.
+
+### 2026-11-23 — Branch kairos-os: class from the kernel
+**Did:**
+- `--class=kernel` (section 4): batch = the class Kairos's kernel keeps
+  for the task's control group, read with `bpf_kairos_task_class()` at
+  each decision, or policy `SCHED_BATCH`/`SCHED_IDLE`.
+- Fixed `pick_victim()`: a victim's class by the chosen rule, not by run
+  time under `--class=cgroup` (section 4).
+
+No new runs.
+
+**Found:** Tested in QEMU on the Kairos kernel (4 CPUs), loader started
+by hand, 4 busy loops (the service crunch) in a group below `batch`,
+and a probe waking every 2 ms (4 s, median lateness):
+- `--main-config --class=kernel`: crunch as batch: 336 us, 2 LC CPUs,
+  ~540 borrows a second; after one write of `lc` to crunch's group,
+  while it ran: 2414 us, 4 LC CPUs, LC demand 5.1, 0 borrows; after
+  `inherit`: 479 us, 2 LC CPUs, ~530 borrows. Emulated timing (TCG):
+  compare within the run only.
+- `--force-preempt --class=kernel` (no split): crunch as batch, 471 of
+  472 preemptions a second hit batch tasks; as LC, 0 of 489.
+- On the Kairos kernel without its patches: `--class=cgroup` loads (the
+  weak call dropped); `--class=kernel` is refused with status 1.
+- On a lockdep and PROVE_RCU build: no reports with the kfunc called at
+  each decision and 20 class writes in a row.
+- Builds against the VM's kernel tree (`~/linux-src`), whose `vmlinux.h`
+  has no `kairos_class`.
+
+**Interpretation:** The class follows a write to the group while the
+tasks run, with no restart and no callback; the LC pool follows it
+within a second.
+
+**Decisions:** Read the class at each decision rather than keep a copy:
+the read is a few loads, and a copy would need the kernel to call the
+policy on every class change.
+
+**Problems:** None.
+
+**Next:** Kairos's init writes `batch` to its batch group's
+`kairos.class` and starts the loader with `--class=kernel`.
