@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <assert.h>
 #include <getopt.h>
+#include <dirent.h>
 #include <libgen.h>
 #include <time.h>
 #include <string.h>
@@ -46,6 +47,11 @@ const char help_fmt[] =
 "      --split             LC CPUs and batch CPUs, each pool serving its own\n"
 "                          queue first and lending idle CPUs to the other\n"
 "      --split-cpus LIST   CPUs the split manages, e.g. 0-2 (default all)\n"
+"      --split-order number|layout  the order in which split CPUs become LC\n"
+"                          CPUs: by CPU number (default), or by the CPU\n"
+"                          layout in /sys: fastest first; then one memory\n"
+"                          node, last-level cache and cluster before the\n"
+"                          next; a core's hardware threads side by side\n"
 "      --lc-min N          fewest LC CPUs (default 1)\n"
 "      --lc-max N          most LC CPUs (default: all split CPUs)\n"
 "      --lc-buffer-pct N   spare LC capacity on top of LC demand, in %% of a\n"
@@ -136,7 +142,9 @@ const char help_fmt[] =
 "\n"
 "Output and diagnostics:\n"
 "  -q, --quiet             don't print the configuration and the per-second\n"
-"                          stats (--stats and --diag still write their files)\n"
+"                          stats (--stats and --diag still write their files;\n"
+"                          with --split, the order of the split CPUs is still\n"
+"                          printed, once)\n"
 "  -s, --stats FILE        also write the per-second stats to FILE as CSV\n"
 "      --diag FILE         count every wait for a CPU and every run, per task\n"
 "                          group, and write them per second to FILE as CSV\n"
@@ -212,6 +220,7 @@ enum {
 	OPT_DIAG_COMM,
 	OPT_SPLIT,
 	OPT_SPLIT_CPUS,
+	OPT_SPLIT_ORDER,
 	OPT_LC_MIN,
 	OPT_LC_MAX,
 	OPT_LC_BUFFER,
@@ -255,6 +264,7 @@ static const struct option long_opts[] = {
 	{ "slow-shift",      required_argument, NULL, OPT_SLOW_SHIFT },
 	{ "split",           no_argument,       NULL, OPT_SPLIT },
 	{ "split-cpus",      required_argument, NULL, OPT_SPLIT_CPUS },
+	{ "split-order",     required_argument, NULL, OPT_SPLIT_ORDER },
 	{ "lc-min",          required_argument, NULL, OPT_LC_MIN },
 	{ "lc-max",          required_argument, NULL, OPT_LC_MAX },
 	{ "lc-buffer-pct",   required_argument, NULL, OPT_LC_BUFFER },
@@ -293,6 +303,7 @@ static const struct option long_opts[] = {
 
 static bool verbose;
 static bool quiet;
+static bool split_by_layout;	/* --split-order layout */
 static volatile int exit_req;
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -396,6 +407,98 @@ static bool kernel_has_class(void)
 	has = btf__find_by_name_kind(btf, "bpf_kairos_task_class", BTF_KIND_FUNC) > 0;
 	btf__free(btf);
 	return has;
+}
+
+/*
+ * --split-order layout: where a CPU sits, as the kernel describes it in
+ * /sys/devices/system/cpu/cpuN. A group is named by its first CPU. A file
+ * that is missing (a kernel without NUMA, an offline CPU) leaves the
+ * default, so CPUs that differ in nothing are ordered by number.
+ */
+struct cpu_place {
+	int cpu;
+	long speed;	/* cpu_capacity: the fastest CPU is 1024 */
+	long node;	/* the memory node it is near */
+	long llc;	/* the CPUs sharing its last-level cache */
+	long cluster;	/* topology/cluster_cpus_list */
+	long core;	/* topology/core_cpus_list: its core's hardware threads */
+};
+
+/* The first number in the file at @path (a value, or a CPU list such as "4-7"). */
+static long first_number(const char *path, long dflt)
+{
+	FILE *f = fopen(path, "r");
+	long v;
+
+	if (!f)
+		return dflt;
+	if (fscanf(f, "%ld", &v) != 1)
+		v = dflt;
+	fclose(f);
+	return v;
+}
+
+static struct cpu_place read_place(int cpu)
+{
+	struct cpu_place p = { .cpu = cpu, .speed = 1024, .core = cpu };
+	char dir[64], path[128];
+	long level, top = 0;
+	struct dirent *e;
+	DIR *d;
+
+	snprintf(dir, sizeof(dir), "/sys/devices/system/cpu/cpu%d", cpu);
+	snprintf(path, sizeof(path), "%s/cpu_capacity", dir);
+	p.speed = first_number(path, 1024);
+	snprintf(path, sizeof(path), "%s/topology/cluster_cpus_list", dir);
+	p.cluster = first_number(path, 0);
+	snprintf(path, sizeof(path), "%s/topology/core_cpus_list", dir);
+	p.core = first_number(path, cpu);
+
+	/* the node: a link named nodeK in the CPU's folder (with NUMA) */
+	d = opendir(dir);
+	while (d && (e = readdir(d)))
+		if (sscanf(e->d_name, "node%ld", &p.node) == 1)
+			break;
+	if (d)
+		closedir(d);
+
+	/* the last-level cache: the cache/indexI with the highest level */
+	for (int i = 0; ; i++) {
+		snprintf(path, sizeof(path), "%s/cache/index%d/level", dir, i);
+		level = first_number(path, -1);
+		if (level < 0)
+			break;
+		if (level > top) {
+			top = level;
+			snprintf(path, sizeof(path), "%s/cache/index%d/shared_cpu_list", dir, i);
+			p.llc = first_number(path, 0);
+		}
+	}
+	return p;
+}
+
+/*
+ * The LC pool is the first CPUs of the order, so the order says what LC
+ * work gets first: the fastest CPUs; then, so that a growing pool stays
+ * close together, one memory node before the next, one last-level cache
+ * before the next, one cluster before the next, and both hardware threads
+ * of a core side by side; then CPU number.
+ */
+static int compare_place(const void *a, const void *b)
+{
+	const struct cpu_place *x = a, *y = b;
+
+	if (x->speed != y->speed)
+		return x->speed > y->speed ? -1 : 1;
+	if (x->node != y->node)
+		return x->node < y->node ? -1 : 1;
+	if (x->llc != y->llc)
+		return x->llc < y->llc ? -1 : 1;
+	if (x->cluster != y->cluster)
+		return x->cluster < y->cluster ? -1 : 1;
+	if (x->core != y->core)
+		return x->core < y->core ? -1 : 1;
+	return x->cpu - y->cpu;
 }
 
 /* Parse a CPU list such as "0-2" or "0,2-3" into a bitmask, or exit. */
@@ -827,6 +930,13 @@ restart:
 		case OPT_SPLIT_CPUS:
 			split_mask = parse_cpus("split-cpus", optarg);
 			break;
+		case OPT_SPLIT_ORDER:
+			if (strcmp(optarg, "number") && strcmp(optarg, "layout")) {
+				fprintf(stderr, "--split-order must be 'number' or 'layout'\n");
+				return 1;
+			}
+			split_by_layout = !strcmp(optarg, "layout");
+			break;
 		case OPT_LC_MIN:
 			skel->rodata->lc_min = parse_num("lc-min", optarg);
 			break;
@@ -978,15 +1088,34 @@ restart:
 	}
 
 	/*
-	 * Split CPUs get ranks 0, 1, ... in CPU order (the first nr_lc are
-	 * the LC CPUs); the others -1.
+	 * Split CPUs get ranks 0, 1, ... (the first nr_lc are the LC CPUs),
+	 * in CPU order or, with --split-order layout, in the layout's order;
+	 * the others -1. With --split, the order is printed, once, even with
+	 * --quiet: it says where LC work will run.
 	 */
 	{
-		int nr_possible = libbpf_num_possible_cpus(), nr_split = 0;
+		int nr_possible = libbpf_num_possible_cpus(), nr_split = 0, n;
+		struct cpu_place place[KAIROS_MAX_CPUS];
 
+		n = nr_possible < KAIROS_MAX_CPUS ? nr_possible : KAIROS_MAX_CPUS;
+		for (int cpu = 0; cpu < n; cpu++)
+			place[cpu] = split_by_layout ? read_place(cpu) :
+				(struct cpu_place){ .cpu = cpu, .core = cpu };
+		if (split_by_layout)
+			qsort(place, n, sizeof(place[0]), compare_place);
 		for (int cpu = 0; cpu < KAIROS_MAX_CPUS; cpu++)
-			skel->rodata->split_rank[cpu] =
-				cpu < nr_possible && (split_mask >> cpu) & 1 ? nr_split++ : -1;
+			skel->rodata->split_rank[cpu] = -1;
+		for (int i = 0; i < n; i++)
+			if ((split_mask >> place[i].cpu) & 1)
+				skel->rodata->split_rank[place[i].cpu] = nr_split++;
+		if (skel->rodata->split) {
+			printf("scx_kairos: split order");
+			for (int i = 0; i < n; i++)
+				if ((split_mask >> place[i].cpu) & 1)
+					printf(" %d", place[i].cpu);
+			printf("\n");
+			fflush(stdout);
+		}
 		if (lc_max < 0 || lc_max > nr_split)
 			lc_max = nr_split;
 		skel->rodata->lc_max = lc_max;
