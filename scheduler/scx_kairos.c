@@ -2,6 +2,8 @@
 /*
  * scx_kairos loader: sets the tunables, loads and attaches the BPF policy,
  * then prints its statistics once a second until Ctrl-C (SIGINT/SIGTERM).
+ * With --pin the scheduler is held by files in a BPF file system rather
+ * than by this program; --adopt watches a scheduler pinned that way.
  *
  * Based on scx_simple's loader: Copyright (c) 2022 Meta Platforms, Inc. and
  * affiliates; Tejun Heo <tj@kernel.org>; David Vernet <dvernet@meta.com>.
@@ -12,11 +14,14 @@
 #include <unistd.h>
 #include <signal.h>
 #include <assert.h>
+#include <errno.h>
 #include <getopt.h>
 #include <dirent.h>
 #include <libgen.h>
+#include <limits.h>
 #include <time.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <linux/magic.h>
@@ -157,8 +162,22 @@ const char help_fmt[] =
 "  -v, --verbose           print libbpf debug messages\n"
 "  -h, --help              display this help and exit\n"
 "\n"
+"Holding the scheduler (branch kairos-os, for the Kairos OS):\n"
+"      --pin DIR           after attaching, pin the scheduler and its maps in\n"
+"                          DIR, a folder in a BPF file system: the scheduler\n"
+"                          then outlives this program. Stopping this program\n"
+"                          (SIGINT, SIGTERM) removes the pins, which unloads\n"
+"                          it. Old pins in DIR are removed first; with a BPF\n"
+"                          scheduler running, this program doesn't start\n"
+"      --pin-and-exit DIR  the same, then exit at once with status 0,\n"
+"                          leaving the scheduler running\n"
+"      --adopt DIR         load nothing: watch the scheduler pinned in DIR as\n"
+"                          if this program had loaded it (statistics, exit\n"
+"                          status); stopping this program unloads it\n"
+"\n"
 "Exit status:\n"
-"  0  unloaded on request: a signal to this program (SIGINT or SIGTERM)\n"
+"  0  unloaded on request: a signal to this program (SIGINT or SIGTERM);\n"
+"     with --pin-and-exit: attached and pinned\n"
 "  1  did not start: a bad option, or the kernel refused the scheduler\n"
 "  3  the kernel unloaded the scheduler without an error: SysRq-S, or the\n"
 "     kernel or the policy asked for it\n"
@@ -245,6 +264,9 @@ enum {
 	OPT_ML_TTL,
 	OPT_CLASS,
 	OPT_BATCH_CGROUP,
+	OPT_PIN,
+	OPT_PIN_AND_EXIT,
+	OPT_ADOPT,
 };
 
 static const struct option long_opts[] = {
@@ -289,6 +311,9 @@ static const struct option long_opts[] = {
 	{ "ml-ttl-ms",       required_argument, NULL, OPT_ML_TTL },
 	{ "class",           required_argument, NULL, OPT_CLASS },
 	{ "batch-cgroup",    required_argument, NULL, OPT_BATCH_CGROUP },
+	{ "pin",             required_argument, NULL, OPT_PIN },
+	{ "pin-and-exit",    required_argument, NULL, OPT_PIN_AND_EXIT },
+	{ "adopt",           required_argument, NULL, OPT_ADOPT },
 	{ "victim",          required_argument, NULL, OPT_VICTIM },
 	{ "batch-min-run-us", required_argument, NULL, OPT_BATCH_MIN_RUN },
 	{ "trace-class",     no_argument,       NULL, OPT_TRACE_CLASS },
@@ -305,6 +330,8 @@ static const struct option long_opts[] = {
 static bool verbose;
 static bool quiet;
 static bool split_by_layout;	/* --split-order layout */
+static const char *pin_dir;	/* --pin, --pin-and-exit or --adopt DIR */
+static bool pin_and_exit, adopt;
 static volatile int exit_req;
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -353,6 +380,164 @@ static int exit_status(int kind)
 static void sigint_handler(int sig)
 {
 	exit_req = 1;
+}
+
+/*
+ * --pin, --pin-and-exit, --adopt. A pin is a file in a BPF file system that
+ * holds a reference to a BPF object, like an open file descriptor that
+ * belongs to no process. The link (the attachment) is pinned as DIR/link and
+ * every map as DIR/<its name>, with dots made underscores. While the link
+ * pin exists, the scheduler stays attached whatever happens to this program.
+ */
+static void map_pin_path(char *buf, size_t size, const char *dir,
+			 const struct bpf_map *map)
+{
+	char *c;
+
+	snprintf(buf, size, "%s/%s", dir, bpf_map__name(map));
+	for (c = buf + strlen(dir) + 1; *c; c++)
+		if (*c == '.')
+			*c = '_';
+}
+
+/* Does no BPF scheduler run (sched_ext's state is "disabled")? */
+static bool no_bpf_scheduler(void)
+{
+	char state[32] = "";
+	FILE *f = fopen("/sys/kernel/sched_ext/state", "r");
+
+	if (f) {
+		if (!fgets(state, sizeof(state), f))
+			state[0] = '\0';
+		fclose(f);
+	}
+	return !strncmp(state, "disabled", 8);
+}
+
+/*
+ * Remove the pins in @dir. When the last reference to the link goes, the
+ * kernel unregisters it, and sched_ext's unregister unloads whichever BPF
+ * scheduler is running (bpf_scx_unreg() -> scx_disable()), not necessarily
+ * the one this link attached. Removing a pin drops its reference later, in a
+ * kernel worker (bpf_link_put()); closing a file descriptor drops it before
+ * close() returns (bpf_link_release()). So the link is opened, its pin
+ * removed, and then the descriptor closed: if that was the last reference,
+ * the release is done here and now, not behind a later scheduler's back.
+ */
+static void release_pins(const char *dir)
+{
+	char path[PATH_MAX];
+	struct dirent *e;
+	DIR *d;
+	int fd;
+
+	snprintf(path, sizeof(path), "%s/link", dir);
+	fd = bpf_obj_get(path);
+	unlink(path);
+	if (fd >= 0)
+		close(fd);
+	d = opendir(dir);
+	while (d && (e = readdir(d))) {
+		if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+		unlink(path);
+	}
+	if (d)
+		closedir(d);
+}
+
+/* Pin every map, then the link, in @dir. 0 or -1. */
+static int pin_all(struct scx_kairos *skel, struct bpf_link *link, const char *dir)
+{
+	char path[PATH_MAX];
+	struct bpf_map *map;
+
+	if (mkdir(dir, 0700) && errno != EEXIST) {
+		fprintf(stderr, "--pin: %s: %s\n", dir, strerror(errno));
+		return -1;
+	}
+	bpf_object__for_each_map(map, skel->obj) {
+		if (bpf_map__type(map) == BPF_MAP_TYPE_STRUCT_OPS)
+			continue;	/* the link holds it */
+		map_pin_path(path, sizeof(path), dir, map);
+		if (bpf_map__pin(map, path)) {
+			fprintf(stderr, "--pin: %s: %s\n", path, strerror(errno));
+			return -1;
+		}
+	}
+	/* last: once this exists, the scheduler outlives this program */
+	snprintf(path, sizeof(path), "%s/link", dir);
+	if (bpf_link__pin(link, path)) {
+		fprintf(stderr, "--pin: %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * --adopt: use the scheduler pinned in @dir instead of loading one. Each map
+ * of the skeleton takes its pinned map's file descriptor, and the global
+ * variables (.bss, .data, .rodata) are mapped into this program's memory as
+ * a load would have mapped them, so everything after the load runs
+ * unchanged. .rodata is frozen, so only a read-only mapping works for it.
+ * Returns a file descriptor of the pinned link (stopping closes it), or -1.
+ */
+static int adopt_pins(struct scx_kairos *skel, const char *dir)
+{
+	struct bpf_object_skeleton *s = skel->skeleton;
+	long page = sysconf(_SC_PAGESIZE);
+	char path[PATH_MAX];
+	int link_fd, fd, i;
+
+	snprintf(path, sizeof(path), "%s/link", dir);
+	link_fd = bpf_obj_get(path);
+	if (link_fd < 0) {
+		fprintf(stderr, "--adopt: no scheduler pinned in %s: %s\n", dir, strerror(errno));
+		return -1;
+	}
+	for (i = 0; i < s->map_cnt; i++) {
+		struct bpf_map_skeleton *m =
+			(struct bpf_map_skeleton *)((char *)s->maps + i * s->map_skel_sz);
+		struct bpf_map *map = *m->map;
+		struct bpf_map_info info = {};
+		__u32 len = sizeof(info);
+		size_t size;
+		void *mem;
+
+		if (bpf_map__type(map) == BPF_MAP_TYPE_STRUCT_OPS)
+			continue;
+		map_pin_path(path, sizeof(path), dir, map);
+		fd = bpf_obj_get(path);
+		/*
+		 * A loader resizes the exit dump's map before loading
+		 * (UEI_SET_SIZE() in SCX_OPS_LOAD()). Resize this program's
+		 * copy to match the pinned map first: libbpf frees its copy
+		 * by the map's size, and a size taken over from the pinned
+		 * map alone would make it free memory it doesn't own.
+		 */
+		if (fd < 0 || bpf_map_get_info_by_fd(fd, &info, &len) ||
+		    (bpf_map__value_size(map) != info.value_size &&
+		     bpf_map__set_value_size(map, info.value_size)) ||
+		    bpf_map__reuse_fd(map, fd)) {
+			fprintf(stderr, "--adopt: %s: %s\n", path, strerror(errno));
+			return -1;
+		}
+		close(fd);	/* bpf_map__reuse_fd() keeps a copy */
+		if (!m->mmaped)
+			continue;
+		size = (size_t)bpf_map__value_size(map) * bpf_map__max_entries(map);
+		size = (size + page - 1) / page * page;
+		mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, bpf_map__fd(map), 0);
+		if (mem == MAP_FAILED)
+			mem = mmap(NULL, size, PROT_READ, MAP_SHARED, bpf_map__fd(map), 0);
+		if (mem == MAP_FAILED) {
+			fprintf(stderr, "--adopt: %s: %s\n", path, strerror(errno));
+			return -1;
+		}
+		*m->mmaped = mem;
+	}
+	return link_fd;
 }
 
 /* Parse a non-negative integer option or exit. */
@@ -827,7 +1012,8 @@ static const char csv_header[] =
 int main(int argc, char **argv)
 {
 	struct scx_kairos *skel;
-	struct bpf_link *link;
+	struct bpf_link *link = NULL;
+	int link_fd = -1;	/* --adopt: the pinned link */
 	const char *stats_path = NULL, *diag_path = NULL;
 	unsigned long long split_mask = ~0ULL;
 	long lc_max = -1;	/* -1: all split CPUs */
@@ -1032,6 +1218,17 @@ restart:
 			if (batch_cgroup_id(optarg, &skel->rodata->batch_cgid))
 				return 1;
 			break;
+		case OPT_PIN:
+		case OPT_PIN_AND_EXIT:
+		case OPT_ADOPT:
+			if (pin_dir && strcmp(pin_dir, optarg)) {
+				fprintf(stderr, "one --pin, --pin-and-exit or --adopt folder\n");
+				return 1;
+			}
+			pin_dir = optarg;
+			pin_and_exit |= opt == OPT_PIN_AND_EXIT;
+			adopt |= opt == OPT_ADOPT;
+			break;
 		case 'q':
 			quiet = true;
 			break;
@@ -1118,7 +1315,8 @@ restart:
 			last_core = place[i].core;
 			skel->rodata->split_rank[place[i].cpu] = nr_split++;
 		}
-		if (skel->rodata->split) {
+		/* an adopter's own options don't describe the adopted scheduler */
+		if (skel->rodata->split && !adopt) {
 			printf("scx_kairos: split order");
 			for (int i = 0; i < n; i++)
 				if ((split_mask >> place[i].cpu) & 1)
@@ -1180,8 +1378,43 @@ restart:
 		}
 	}
 
-	SCX_OPS_LOAD(skel, kairos_ops, scx_kairos, uei);
-	link = SCX_OPS_ATTACH(skel, kairos_ops, scx_kairos);
+	if (pin_and_exit && adopt) {
+		fprintf(stderr, "--pin-and-exit and --adopt don't go together\n");
+		return 1;
+	}
+	if (adopt) {
+		link_fd = adopt_pins(skel, pin_dir);
+		if (link_fd < 0)
+			return EXIT_NOT_STARTED;
+		if (!quiet)
+			printf("scx_kairos: adopted the scheduler pinned in %s\n", pin_dir);
+	} else {
+		/*
+		 * Old pins, left by a scheduler the kernel unloaded, must go
+		 * before a new one is attached (see release_pins()). With a
+		 * BPF scheduler running they aren't old: don't start.
+		 */
+		if (pin_dir) {
+			if (!no_bpf_scheduler()) {
+				fprintf(stderr, "a BPF scheduler is running: stop it, or --adopt %s\n",
+					pin_dir);
+				return EXIT_NOT_STARTED;
+			}
+			release_pins(pin_dir);
+		}
+		SCX_OPS_LOAD(skel, kairos_ops, scx_kairos, uei);
+		link = SCX_OPS_ATTACH(skel, kairos_ops, scx_kairos);
+		if (pin_dir && pin_all(skel, link, pin_dir)) {
+			release_pins(pin_dir);
+			bpf_link__destroy(link);
+			return EXIT_NOT_STARTED;
+		}
+		if (pin_and_exit) {
+			/* the link pin holds the scheduler; closing ours is fine */
+			printf("scx_kairos: attached; pinned in %s\n", pin_dir);
+			return 0;
+		}
+	}
 
 	if (stats_path && !csv) {
 		csv = fopen(stats_path, "w");
@@ -1394,12 +1627,23 @@ restart:
 		prev_idleq_ns = idleq_ns;
 	}
 
-	bpf_link__destroy(link);
+	/*
+	 * Stopping or stopped: the pins go first, so that closing the link
+	 * (ours, or the adopted one) drops the last reference and unloads the
+	 * scheduler before UEI_REPORT() reads why it ended.
+	 */
+	if (pin_dir)
+		release_pins(pin_dir);
+	if (adopt)
+		close(link_fd);
+	else
+		bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
 	kind = skel->data->uei.kind;	/* gone with the skeleton */
 	scx_kairos__destroy(skel);
 
-	if (UEI_ECODE_RESTART(ecode))
+	/* an adopter leaves restarts to whoever started it: there is no pin left */
+	if (UEI_ECODE_RESTART(ecode) && !adopt)
 		goto restart;
 	if (csv)
 		fclose(csv);

@@ -1138,6 +1138,35 @@ choices. Add as you go.)
   - Not done: a rule per wakeup that keeps batch off the other thread
     of a core running LC work. It can't be measured in QEMU, whose
     threads share no real core.
+- **`--pin`, `--pin-and-exit`, `--adopt DIR` (2026-11-24, branch
+  `kairos-os` only).** The scheduler held by pins in a BPF file system
+  folder rather than by the loader, so the Kairos kernel can attach it
+  before init and init can watch it.
+  - **Pins:** every map but the struct_ops one as `DIR/<name>` (dots
+    made underscores; libbpf's internal names, e.g. `scx_kair_bss`,
+    `_data_uei_dump`), then the link as `DIR/link`. While the link pin
+    exists the scheduler stays attached, whatever happens to the loader.
+  - **`--adopt`:** no load. Each skeleton map takes its pin's fd
+    (`bpf_map__reuse_fd()`), and `.bss`/`.data`/`.rodata` are mmapped
+    and put in the skeleton's pointers, so the stats loop,
+    `UEI_EXITED()` and `UEI_REPORT()` run unchanged. `.rodata` is frozen:
+    read-only mmap. The exit dump map is resized by a loader before load
+    (`UEI_SET_SIZE()`), so the adopter first sets its copy to the pinned
+    size (`bpf_map__set_value_size()`); without that, libbpf freed its
+    copy by the pinned size at exit: a segfault after `EXIT:`.
+  - **Releasing:** the last reference to a struct_ops link unregisters
+    it, and sched_ext's unregister unloads whichever scheduler is
+    current (`bpf_scx_unreg()` -> `scx_disable()` on `scx_root`), not
+    necessarily this link's. Removing a pin drops its reference later, in
+    a worker (`bpf_link_put()`); closing an fd drops it before `close()`
+    returns (`bpf_link_release()` -> `bpf_link_put_direct()`). So pins
+    are removed by opening the link, unlinking, closing
+    (`release_pins()`): the release happens there, never behind a later
+    scheduler's back. A load with `--pin` removes old pins first, and
+    refuses to start while sched_ext's state isn't `disabled`.
+  - **Stopping** (SIGINT/SIGTERM) removes the pins, then closes the link:
+    unloaded, status 0, as before. An adopter never restarts by itself
+    (`UEI_ECODE_RESTART`): whoever started it loads anew.
 
 ---
 
@@ -6149,3 +6178,39 @@ evaluated.
 **Problems:** None.
 
 **Next:** Kairos's init starts the loader with `--split-order=layout`.
+
+### 2026-11-24 — Branch kairos-os: the scheduler held by a pin
+**Did:** `--pin`, `--pin-and-exit` and `--adopt DIR` (section 4), for the
+Kairos OS: its kernel will attach the scheduler before init with
+`--pin-and-exit`, and init will watch it with `--adopt`. No new runs.
+
+**Found:** Tested by hand in QEMU on the Kairos kernel (4 CPUs, the
+scheduler off at boot, a BPF file system on `/sys/fs/bpf`):
+- `--pin-and-exit`: status 0; the scheduler enabled; 11 pins (10 maps
+  and the link).
+- An adopter killed with SIGKILL: still enabled, sched_ext's
+  `enable_seq` unchanged (1). A `--pin` loader killed the same way: the
+  same.
+- An adopter's statistics as a loader's (`split: lc_cpus now 2 ...`).
+  SIGTERM to an adopter or a `--pin` loader: "disabled (unregistered from
+  user space)", `EXIT: unregistered from user space`, status 0, no pins
+  left.
+- A second `--pin` load while one runs: refused, status 1, the running
+  one untouched.
+- First version: the adopter segfaulted (status 139) after `EXIT:`;
+  libbpf freed its copy of the exit dump map by the pinned, larger size.
+  Fixed by resizing the copy first.
+- Not tested yet: pins left by a scheduler the kernel unloaded (needs
+  SysRq-S, not in the Kairos kernel's main config).
+
+**Interpretation:** The scheduler's lifetime is now the pin's, not a
+process's.
+
+**Decisions:** Release pins by open, unlink, close, so that the last
+reference is dropped synchronously (section 4). Refuse a `--pin` load
+while any BPF scheduler runs, rather than remove its pins.
+
+**Problems:** The segfault above.
+
+**Next:** Kairos's init adopts a scheduler attached before it, and its
+kernel attaches one.
