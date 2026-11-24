@@ -1167,6 +1167,16 @@ choices. Add as you go.)
   - **Stopping** (SIGINT/SIGTERM) removes the pins, then closes the link:
     unloaded, status 0, as before. An adopter never restarts by itself
     (`UEI_ECODE_RESTART`): whoever started it loads anew.
+  - **Timers stop at exit (same day).** The policy's BPF timers live as
+    long as its maps, and pins keep the maps of a scheduler the kernel
+    unloaded. `kairos_timerfn()` re-armed itself and called
+    `scx_bpf_get_idle_cpumask()` every tick; kfuncs act on `scx_root`,
+    whichever scheduler is current. A new scheduler loaded beside such
+    pins was unloaded during its start-up: "runtime error (built-in idle
+    tracking is disabled)" (`scx_enable()` sets `scx_root` before
+    `scx_idle_enable()`; `check_builtin_idle_enabled()` errors against
+    the root). Now `kairos_exit()` sets `exited`, and both timer
+    callbacks return without re-arming once it is set.
 
 ---
 
@@ -6214,3 +6224,32 @@ while any BPF scheduler runs, rather than remove its pins.
 
 **Next:** Kairos's init adopts a scheduler attached before it, and its
 kernel attaches one.
+
+### 2026-11-24 — Branch kairos-os: timers stop when the scheduler exits
+**Did:** `kairos_exit()` sets `exited`; `kairos_timerfn()` and
+`wait_timerfn()` stop re-arming once it is set (section 4). No new runs.
+
+**Found:** QEMU, the Kairos lock-checking kernel (SysRq on), the
+scheduler attached and pinned, then unloaded by SysRq-S with its pins
+left in place:
+- Before the fix, a new scheduler loaded beside the old pins was unloaded
+  during its start-up: "runtime error (built-in idle tracking is
+  disabled)". The old timer was still firing and calling idle kfuncs.
+- After it, the new scheduler loads and runs (`enable_seq` 2). Removing
+  the old link's pin then unloads the new one: "disabled (unregistered
+  from user space)". That is sched_ext's unregister acting on the current
+  scheduler, which `--pin` guards against by removing old pins before a
+  load. Through Kairos's init (kill the adopter, SysRq-S, init reloads
+  with `--pin`): the new scheduler runs and is still enabled 6 s later.
+- No lockdep or RCU reports. Kairos's boot test 22 of 22 at 4 CPUs and on
+  2 clusters x 2 cores x 2 threads.
+
+**Interpretation:** A pinned scheduler outlives its exit as BPF objects;
+anything it runs on its own (timers) must stop at exit.
+
+**Decisions:** Stop the timers by a flag set in ops.exit() rather than
+`bpf_timer_cancel()`: the callbacks are the only place that re-arms.
+
+**Problems:** The start-up failure above.
+
+**Next:** Pin moved in the Kairos OS; its component 8 wrap-up.

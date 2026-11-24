@@ -281,6 +281,18 @@ const volatile char diag_comm[DIAG_NAMED][DIAG_COMM_LEN];
 
 UEI_DEFINE(uei);
 
+/*
+ * Set by kairos_exit(). This program's BPF timers live as long as its maps,
+ * not as long as the scheduler: normally the loader ends right after and
+ * everything is freed, but pins (--pin, the Kairos OS) keep the maps of a
+ * scheduler the kernel unloaded until they are removed. A timer that kept
+ * firing would keep calling sched_ext's kfuncs, which act on whichever
+ * scheduler is current; in a later scheduler's start-up that raised
+ * "built-in idle tracking is disabled" against the new one and unloaded it.
+ * So once the scheduler has exited, the timers stop.
+ */
+bool exited;
+
 #define SHARED_DSQ 0
 #define LC_DSQ 1	/* --split: latency-critical tasks */
 #define BATCH_DSQ 2	/* --split: batch tasks */
@@ -1615,6 +1627,9 @@ static int kairos_timerfn(void *map, int *key, struct bpf_timer *timer)
 	s64 nr = nr_runnable;
 	u64 load = nr > 0 ? (u64)nr * 1024 / nr_cpus : 0;
 
+	if (exited)	/* not re-armed: the timer stops */
+		return 0;
+
 	fast_load = ewma(fast_load, load, fast_shift);
 	slow_load = ewma(slow_load, load, slow_shift);
 
@@ -1673,6 +1688,9 @@ static int wait_timerfn(void *map, int *key, struct bpf_timer *timer)
 	bool found = false, more = false, kicked = false;
 	struct task_struct *p;
 	s32 cpu, alt, prev = -1;
+
+	if (exited)
+		return 0;
 
 	wait_timer_armed = 0;
 	bpf_for_each(scx_dsq, p, LC_DSQ, 0) {
@@ -1785,6 +1803,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(kairos_init)
 
 void BPF_STRUCT_OPS(kairos_exit, struct scx_exit_info *ei)
 {
+	exited = true;
 	UEI_RECORD(uei, ei);
 }
 
