@@ -167,9 +167,14 @@ enum kairos_os_class bpf_kairos_task_class(struct task_struct *p) __ksym __weak;
  * split CPUs (-1: not in the split; such CPUs act as LC CPUs). The first
  * nr_lc split CPUs are LC CPUs. nr_lc stays within [lc_min, lc_max]; the
  * timer sets it to ceil(LC demand + lc_buffer), in CPUs x 1024.
+ * split_mid_core[r]: the split CPU at rank r + 1 is a hardware thread of the
+ * same core as the one at rank r, so a pool of r + 1 CPUs would end inside a
+ * core; the timer rounds the pool up past it (--split-order layout puts a
+ * core's threads side by side; by number every CPU counts as its own core).
  */
 const volatile bool split;
 const volatile s32 split_rank[KAIROS_MAX_CPUS];
+const volatile bool split_mid_core[KAIROS_MAX_CPUS];
 const volatile u32 lc_min = 1, lc_max = 1;	/* the loader sets lc_max */
 const volatile u64 lc_buffer = 512;		/* half a CPU */
 /* Shrink the LC pool only if it would still shrink with this much more demand. */
@@ -1425,6 +1430,31 @@ static u64 nr_lc_queued(void)
 }
 
 /*
+ * --split: a pool of @n CPUs, grown until it doesn't end inside a core,
+ * but not past lc_max. Hardware threads of one core share its execution
+ * units and caches, so a batch task on the other thread of an LC CPU's core
+ * would slow the LC task down. Rounding up after the hysteresis keeps a
+ * pool of whole cores from shrinking to half a core and growing back.
+ * (n - 1 for n = 0 wraps around, which MEMBER_VPTR rejects; the loader
+ * keeps lc_min >= 1 anyway.)
+ */
+static u32 round_to_cores(u32 n)
+{
+	const volatile bool *mid;
+	u32 i;
+
+	bpf_for(i, 0, KAIROS_MAX_CPUS) {
+		if (n >= lc_max)
+			break;
+		mid = MEMBER_VPTR(split_mid_core, [n - 1]);
+		if (!mid || !*mid)
+			break;
+		n++;
+	}
+	return n;
+}
+
+/*
  * --split: size the LC pool. Demand per tick = CPUs' worth of LC run time
  * in the tick + one CPU per LC task waiting in the LC queue (work that
  * didn't get a CPU), averaged with weight 1/2^lc_shift per tick (~64 ms):
@@ -1433,8 +1463,9 @@ static u64 nr_lc_queued(void)
  * average changed the pool 11-24 times a second on an idle system.)
  * nr_lc = ceil(demand + lc_buffer), within [lc_min, lc_max]; it shrinks
  * only if it would also with lc_hyst more demand, so demand near a whole
- * CPU doesn't flip it back and forth. Tasks keep running where they are
- * when a CPU changes pool; the change applies at their next dispatch.
+ * CPU doesn't flip it back and forth. Then it is rounded up to whole cores
+ * (round_to_cores()). Tasks keep running where they are when a CPU changes
+ * pool; the change applies at their next dispatch.
  */
 static void update_split(u64 dt)
 {
@@ -1469,6 +1500,7 @@ static void update_split(u64 dt)
 		n = lc_min;
 	if (n > lc_max)
 		n = lc_max;
+	n = round_to_cores(n);
 	if (n != nr_lc) {
 		nr_lc = n;
 		nr_lc_changes++;

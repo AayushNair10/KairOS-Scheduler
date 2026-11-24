@@ -51,7 +51,8 @@ const char help_fmt[] =
 "                          CPUs: by CPU number (default), or by the CPU\n"
 "                          layout in /sys: fastest first; then one memory\n"
 "                          node, last-level cache and cluster before the\n"
-"                          next; a core's hardware threads side by side\n"
+"                          next; a core's hardware threads side by side,\n"
+"                          and the LC pool rounded up to whole cores\n"
 "      --lc-min N          fewest LC CPUs (default 1)\n"
 "      --lc-max N          most LC CPUs (default: all split CPUs)\n"
 "      --lc-buffer-pct N   spare LC capacity on top of LC demand, in %% of a\n"
@@ -1090,12 +1091,16 @@ restart:
 	/*
 	 * Split CPUs get ranks 0, 1, ... (the first nr_lc are the LC CPUs),
 	 * in CPU order or, with --split-order layout, in the layout's order;
-	 * the others -1. With --split, the order is printed, once, even with
-	 * --quiet: it says where LC work will run.
+	 * the others -1. A rank whose next split CPU is on the same core gets
+	 * split_mid_core, and the policy rounds the pool up past it. (By
+	 * number, every CPU is its own core: nothing is rounded.) With
+	 * --split, the order is printed, once, even with --quiet: it says
+	 * where LC work will run.
 	 */
 	{
 		int nr_possible = libbpf_num_possible_cpus(), nr_split = 0, n;
 		struct cpu_place place[KAIROS_MAX_CPUS];
+		long last_core = -1;
 
 		n = nr_possible < KAIROS_MAX_CPUS ? nr_possible : KAIROS_MAX_CPUS;
 		for (int cpu = 0; cpu < n; cpu++)
@@ -1105,9 +1110,14 @@ restart:
 			qsort(place, n, sizeof(place[0]), compare_place);
 		for (int cpu = 0; cpu < KAIROS_MAX_CPUS; cpu++)
 			skel->rodata->split_rank[cpu] = -1;
-		for (int i = 0; i < n; i++)
-			if ((split_mask >> place[i].cpu) & 1)
-				skel->rodata->split_rank[place[i].cpu] = nr_split++;
+		for (int i = 0; i < n; i++) {
+			if (!((split_mask >> place[i].cpu) & 1))
+				continue;
+			if (nr_split && place[i].core == last_core)
+				skel->rodata->split_mid_core[nr_split - 1] = true;
+			last_core = place[i].core;
+			skel->rodata->split_rank[place[i].cpu] = nr_split++;
+		}
 		if (skel->rodata->split) {
 			printf("scx_kairos: split order");
 			for (int i = 0; i < n; i++)

@@ -1113,6 +1113,31 @@ choices. Add as you go.)
   (`class_by_run()`); every other rule uses `cpu_ctx.batch`, noted when
   the task started running. Only reached without `--split`, which the
   Kairos OS always uses.
+- **`--split-order layout` (2026-11-23, branch `kairos-os` only).** The
+  order in which split CPUs become LC CPUs (`split_rank`), read once at
+  load from `/sys/devices/system/cpu/cpuN`: `cpu_capacity` descending;
+  then ascending the memory node (a `nodeK` link in the CPU's folder),
+  the last-level cache (the highest `cache/indexI/level`, named by the
+  first CPU of its `shared_cpu_list`), the cluster
+  (`topology/cluster_cpus_list`) and the core
+  (`topology/core_cpus_list`); then the CPU number. A missing file
+  leaves a default, so CPUs that differ in nothing keep number order.
+  The default stays `number`, so `--main-config` is as evaluated.
+  - **Once, at load:** the layout doesn't change while the system runs
+    (no CPU hotplug in the Kairos kernel; frequency changes don't
+    reorder cores).
+  - **Whole cores.** `split_mid_core[r]` (rodata, by rank): the split
+    CPU at rank r + 1 is on the same core as the one at rank r.
+    `round_to_cores()` grows `nr_lc` past such ranks, after the
+    hysteresis and the `lc_min`/`lc_max` clamp and never past `lc_max`
+    (a `bpf_for` bounded by `KAIROS_MAX_CPUS`; `MEMBER_VPTR` for the
+    index n - 1). By number every CPU counts as its own core, so
+    nothing is rounded.
+  - The order is printed once at load, even with `--quiet`
+    ("scx_kairos: split order ...").
+  - Not done: a rule per wakeup that keeps batch off the other thread
+    of a core running LC work. It can't be measured in QEMU, whose
+    threads share no real core.
 
 ---
 
@@ -6087,3 +6112,40 @@ policy on every class change.
 
 **Next:** Kairos's init writes `batch` to its batch group's
 `kairos.class` and starts the loader with `--class=kernel`.
+
+### 2026-11-23 — Branch kairos-os: the LC pool by CPU layout
+**Did:** `--split-order number|layout`, and the LC pool rounded up to
+whole cores under `layout` (section 4). No new runs.
+
+**Found:** Tested in QEMU on the Kairos kernel with CPU layouts QEMU
+presents (unequal speeds through an edited device tree), loader started
+by hand with `--main-config --class=kernel`:
+- Orders: 4 equal CPUs `0 1 2 3`; 2 clusters x 2 cores x 2 threads
+  `0 1 2 3 4 5 6 7` (QEMU numbers a core's threads side by side); CPUs
+  4-7 twice as fast `4 5 6 7 0 1 2 3`; 2 memory nodes (node 0: CPUs 0-1
+  and 4-5) `0 1 4 5 2 3 6 7`. The probe (LC; pool of 2) ran on the
+  order's first two CPUs in 96 of 100 samples on each of the last three.
+- 2 x 2 x 2 threads, `--lc-min 3`: pool 4 by layout, 3 by number, 3 by
+  layout with `--lc-max 3`. 4 equal CPUs, by layout: 3.
+- 2 x 2 x 2 threads, an LC loop that runs and sleeps (LC demand ~1.1):
+  pool 2, 4 while it ran, 2 after, by layout; 2, 3, 2 by number.
+- A lone CPU-bound LC task on an otherwise idle machine: LC demand read
+  0.06 for seconds, then 4-9 at once. When a CPU has nothing else to
+  run, sched_ext keeps the running task and refills its slice
+  (`balance_one()`, `SCX_RQ_BAL_KEEP` without `SCX_OPS_ENQ_LAST`), so
+  `stopping()`, where `lc_run_ns` is added, isn't called until
+  something else needs the CPU. The same on `main`. Only on an idle
+  machine, where the pool's size matters least (a guess: not measured
+  under load).
+
+**Interpretation:** Placement only. Whether whole cores or fast CPUs
+first speed up LC work can't be measured in emulation.
+
+**Decisions:** The layout is read once at load: it doesn't change while
+the system runs. Round up, not down: the pool is there to give LC work
+spare capacity. Number order unchanged, so `--main-config` stays as
+evaluated.
+
+**Problems:** None.
+
+**Next:** Kairos's init starts the loader with `--split-order=layout`.
