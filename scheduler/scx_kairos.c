@@ -2,6 +2,8 @@
 /*
  * scx_kairos loader: sets the tunables, loads and attaches the BPF policy,
  * then prints its statistics once a second until Ctrl-C (SIGINT/SIGTERM).
+ * With --pin the scheduler is held by files in a BPF file system rather
+ * than by this program; --adopt watches a scheduler pinned that way.
  *
  * Based on scx_simple's loader: Copyright (c) 2022 Meta Platforms, Inc. and
  * affiliates; Tejun Heo <tj@kernel.org>; David Vernet <dvernet@meta.com>.
@@ -12,10 +14,19 @@
 #include <unistd.h>
 #include <signal.h>
 #include <assert.h>
+#include <errno.h>
 #include <getopt.h>
+#include <dirent.h>
 #include <libgen.h>
+#include <limits.h>
 #include <time.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
+#include <linux/magic.h>
 #include <bpf/bpf.h>
+#include <bpf/btf.h>
 #include <scx/common.h>
 #include "scx_kairos.h"
 #include "scx_kairos.bpf.skel.h"
@@ -41,6 +52,12 @@ const char help_fmt[] =
 "      --split             LC CPUs and batch CPUs, each pool serving its own\n"
 "                          queue first and lending idle CPUs to the other\n"
 "      --split-cpus LIST   CPUs the split manages, e.g. 0-2 (default all)\n"
+"      --split-order number|layout  the order in which split CPUs become LC\n"
+"                          CPUs: by CPU number (default), or by the CPU\n"
+"                          layout in /sys: fastest first; then one memory\n"
+"                          node, last-level cache and cluster before the\n"
+"                          next; a core's hardware threads side by side,\n"
+"                          and the LC pool rounded up to whole cores\n"
 "      --lc-min N          fewest LC CPUs (default 1)\n"
 "      --lc-max N          most LC CPUs (default: all split CPUs)\n"
 "      --lc-buffer-pct N   spare LC capacity on top of LC demand, in %% of a\n"
@@ -62,9 +79,16 @@ const char help_fmt[] =
 "                          task before its own queue's once that task has\n"
 "                          waited N ms (default 0: off; the kernel unloads the\n"
 "                          scheduler after a 30 s wait)\n"
-"      --class run|policy  batch = ran --batch-min-run-us since it slept (run),\n"
-"                          or has policy SCHED_BATCH/SCHED_IDLE (policy)\n"
+"      --class run|policy|cgroup|kernel  batch = ran --batch-min-run-us\n"
+"                          since it slept (run), or has policy\n"
+"                          SCHED_BATCH/SCHED_IDLE (policy), or is in the\n"
+"                          --batch-cgroup group or below it or has one of\n"
+"                          those policies (cgroup), or the kernel's class for\n"
+"                          it (Kairos's kernel: kairos.class) is batch or it\n"
+"                          has one of those policies (kernel)\n"
 "                          (default run; E5 found policy much better)\n"
+"      --batch-cgroup PATH  --class=cgroup: the batch group, a folder in the\n"
+"                          control-group (version 2) file system\n"
 "      --batch-min-run-us N  --class=run: a task is batch once it has run N us\n"
 "                          of CPU since it last slept (default 20000)\n"
 "\n"
@@ -123,6 +147,10 @@ const char help_fmt[] =
 "      --slow-shift N      slow load EWMA weight 1/2^N per tick (default 6)\n"
 "\n"
 "Output and diagnostics:\n"
+"  -q, --quiet             don't print the configuration and the per-second\n"
+"                          stats (--stats and --diag still write their files;\n"
+"                          with --split, the order of the split CPUs is still\n"
+"                          printed, once)\n"
 "  -s, --stats FILE        also write the per-second stats to FILE as CSV\n"
 "      --diag FILE         count every wait for a CPU and every run, per task\n"
 "                          group, and write them per second to FILE as CSV\n"
@@ -132,7 +160,30 @@ const char help_fmt[] =
 "  -t, --trace             bpf_printk every enqueue (read trace_pipe)\n"
 "      --trace-class       bpf_printk every batch class change\n"
 "  -v, --verbose           print libbpf debug messages\n"
-"  -h, --help              display this help and exit\n";
+"  -h, --help              display this help and exit\n"
+"\n"
+"Holding the scheduler (branch kairos-os, for the Kairos OS):\n"
+"      --pin DIR           after attaching, pin the scheduler and its maps in\n"
+"                          DIR, a folder in a BPF file system: the scheduler\n"
+"                          then outlives this program. Stopping this program\n"
+"                          (SIGINT, SIGTERM) removes the pins, which unloads\n"
+"                          it. Old pins in DIR are removed first; with a BPF\n"
+"                          scheduler running, this program doesn't start\n"
+"      --pin-and-exit DIR  the same, then exit at once with status 0,\n"
+"                          leaving the scheduler running\n"
+"      --adopt DIR         load nothing: watch the scheduler pinned in DIR as\n"
+"                          if this program had loaded it (statistics, exit\n"
+"                          status); stopping this program unloads it\n"
+"\n"
+"Exit status:\n"
+"  0  unloaded on request: a signal to this program (SIGINT or SIGTERM);\n"
+"     with --pin-and-exit: attached and pinned\n"
+"  1  did not start: a bad option, or the kernel refused the scheduler\n"
+"  3  the kernel unloaded the scheduler without an error: SysRq-S, or the\n"
+"     kernel or the policy asked for it\n"
+"  4  the kernel unloaded the scheduler after an error\n"
+"  5  the kernel unloaded the scheduler because a runnable task waited too\n"
+"     long for a CPU (its watchdog)\n";
 
 /*
  * --main-config: the configuration the evaluation chose (RESEARCH_LOG
@@ -189,6 +240,7 @@ enum {
 	OPT_DIAG_COMM,
 	OPT_SPLIT,
 	OPT_SPLIT_CPUS,
+	OPT_SPLIT_ORDER,
 	OPT_LC_MIN,
 	OPT_LC_MAX,
 	OPT_LC_BUFFER,
@@ -211,6 +263,10 @@ enum {
 	OPT_ML_PERIOD,
 	OPT_ML_TTL,
 	OPT_CLASS,
+	OPT_BATCH_CGROUP,
+	OPT_PIN,
+	OPT_PIN_AND_EXIT,
+	OPT_ADOPT,
 };
 
 static const struct option long_opts[] = {
@@ -231,6 +287,7 @@ static const struct option long_opts[] = {
 	{ "slow-shift",      required_argument, NULL, OPT_SLOW_SHIFT },
 	{ "split",           no_argument,       NULL, OPT_SPLIT },
 	{ "split-cpus",      required_argument, NULL, OPT_SPLIT_CPUS },
+	{ "split-order",     required_argument, NULL, OPT_SPLIT_ORDER },
 	{ "lc-min",          required_argument, NULL, OPT_LC_MIN },
 	{ "lc-max",          required_argument, NULL, OPT_LC_MAX },
 	{ "lc-buffer-pct",   required_argument, NULL, OPT_LC_BUFFER },
@@ -253,9 +310,14 @@ static const struct option long_opts[] = {
 	{ "ml-period-ms",    required_argument, NULL, OPT_ML_PERIOD },
 	{ "ml-ttl-ms",       required_argument, NULL, OPT_ML_TTL },
 	{ "class",           required_argument, NULL, OPT_CLASS },
+	{ "batch-cgroup",    required_argument, NULL, OPT_BATCH_CGROUP },
+	{ "pin",             required_argument, NULL, OPT_PIN },
+	{ "pin-and-exit",    required_argument, NULL, OPT_PIN_AND_EXIT },
+	{ "adopt",           required_argument, NULL, OPT_ADOPT },
 	{ "victim",          required_argument, NULL, OPT_VICTIM },
 	{ "batch-min-run-us", required_argument, NULL, OPT_BATCH_MIN_RUN },
 	{ "trace-class",     no_argument,       NULL, OPT_TRACE_CLASS },
+	{ "quiet",           no_argument,       NULL, 'q' },
 	{ "stats",           required_argument, NULL, 's' },
 	{ "diag",            required_argument, NULL, OPT_DIAG },
 	{ "diag-comm",       required_argument, NULL, OPT_DIAG_COMM },
@@ -266,6 +328,10 @@ static const struct option long_opts[] = {
 };
 
 static bool verbose;
+static bool quiet;
+static bool split_by_layout;	/* --split-order layout */
+static const char *pin_dir;	/* --pin, --pin-and-exit or --adopt DIR */
+static bool pin_and_exit, adopt;
 static volatile int exit_req;
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -275,9 +341,203 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 	return vfprintf(stderr, format, args);
 }
 
+/*
+ * Exit statuses, for whoever started this program and has to decide what to
+ * do when it ends (an init or a service manager). 1 is also what a bad
+ * option and a failed load or attach give (exit(1), SCX_BUG).
+ */
+enum {
+	EXIT_UNLOADED	= 0,	/* a signal to this program */
+	EXIT_NOT_STARTED = 1,
+	EXIT_KERNEL	= 3,	/* the kernel unloaded it, no error */
+	EXIT_ERROR	= 4,	/* ... after an error */
+	EXIT_STALL	= 5,	/* ... a runnable task waited too long */
+};
+
+/*
+ * Turn the kernel's reason for unloading the scheduler (enum scx_exit_kind,
+ * which ops.exit() stored in uei.kind) into an exit status.
+ *
+ * The kinds are read by name from the running kernel's type information
+ * rather than copied here as numbers. They are in order: the unloads that
+ * aren't errors first, then SCX_EXIT_ERROR and the kinds of error after it.
+ */
+static int exit_status(int kind)
+{
+	int unreg = __COMPAT_ENUM_OR_ZERO("scx_exit_kind", "SCX_EXIT_UNREG");
+	int error = __COMPAT_ENUM_OR_ZERO("scx_exit_kind", "SCX_EXIT_ERROR");
+	int stall = __COMPAT_ENUM_OR_ZERO("scx_exit_kind", "SCX_EXIT_ERROR_STALL");
+
+	if (kind == unreg)	/* this program closed the link */
+		return EXIT_UNLOADED;
+	if (kind == stall)
+		return EXIT_STALL;
+	if (kind >= error)
+		return EXIT_ERROR;
+	return EXIT_KERNEL;
+}
+
 static void sigint_handler(int sig)
 {
 	exit_req = 1;
+}
+
+/*
+ * --pin, --pin-and-exit, --adopt. A pin is a file in a BPF file system that
+ * holds a reference to a BPF object, like an open file descriptor that
+ * belongs to no process. The link (the attachment) is pinned as DIR/link and
+ * every map as DIR/<its name>, with dots made underscores. While the link
+ * pin exists, the scheduler stays attached whatever happens to this program.
+ */
+static void map_pin_path(char *buf, size_t size, const char *dir,
+			 const struct bpf_map *map)
+{
+	char *c;
+
+	snprintf(buf, size, "%s/%s", dir, bpf_map__name(map));
+	for (c = buf + strlen(dir) + 1; *c; c++)
+		if (*c == '.')
+			*c = '_';
+}
+
+/* Does no BPF scheduler run (sched_ext's state is "disabled")? */
+static bool no_bpf_scheduler(void)
+{
+	char state[32] = "";
+	FILE *f = fopen("/sys/kernel/sched_ext/state", "r");
+
+	if (f) {
+		if (!fgets(state, sizeof(state), f))
+			state[0] = '\0';
+		fclose(f);
+	}
+	return !strncmp(state, "disabled", 8);
+}
+
+/*
+ * Remove the pins in @dir. When the last reference to the link goes, the
+ * kernel unregisters it, and sched_ext's unregister unloads whichever BPF
+ * scheduler is running (bpf_scx_unreg() -> scx_disable()), not necessarily
+ * the one this link attached. Removing a pin drops its reference later, in a
+ * kernel worker (bpf_link_put()); closing a file descriptor drops it before
+ * close() returns (bpf_link_release()). So the link is opened, its pin
+ * removed, and then the descriptor closed: if that was the last reference,
+ * the release is done here and now, not behind a later scheduler's back.
+ */
+static void release_pins(const char *dir)
+{
+	char path[PATH_MAX];
+	struct dirent *e;
+	DIR *d;
+	int fd;
+
+	snprintf(path, sizeof(path), "%s/link", dir);
+	fd = bpf_obj_get(path);
+	unlink(path);
+	if (fd >= 0)
+		close(fd);
+	d = opendir(dir);
+	while (d && (e = readdir(d))) {
+		if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+		unlink(path);
+	}
+	if (d)
+		closedir(d);
+}
+
+/* Pin every map, then the link, in @dir. 0 or -1. */
+static int pin_all(struct scx_kairos *skel, struct bpf_link *link, const char *dir)
+{
+	char path[PATH_MAX];
+	struct bpf_map *map;
+
+	if (mkdir(dir, 0700) && errno != EEXIST) {
+		fprintf(stderr, "--pin: %s: %s\n", dir, strerror(errno));
+		return -1;
+	}
+	bpf_object__for_each_map(map, skel->obj) {
+		if (bpf_map__type(map) == BPF_MAP_TYPE_STRUCT_OPS)
+			continue;	/* the link holds it */
+		map_pin_path(path, sizeof(path), dir, map);
+		if (bpf_map__pin(map, path)) {
+			fprintf(stderr, "--pin: %s: %s\n", path, strerror(errno));
+			return -1;
+		}
+	}
+	/* last: once this exists, the scheduler outlives this program */
+	snprintf(path, sizeof(path), "%s/link", dir);
+	if (bpf_link__pin(link, path)) {
+		fprintf(stderr, "--pin: %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * --adopt: use the scheduler pinned in @dir instead of loading one. Each map
+ * of the skeleton takes its pinned map's file descriptor, and the global
+ * variables (.bss, .data, .rodata) are mapped into this program's memory as
+ * a load would have mapped them, so everything after the load runs
+ * unchanged. .rodata is frozen, so only a read-only mapping works for it.
+ * Returns a file descriptor of the pinned link (stopping closes it), or -1.
+ */
+static int adopt_pins(struct scx_kairos *skel, const char *dir)
+{
+	struct bpf_object_skeleton *s = skel->skeleton;
+	long page = sysconf(_SC_PAGESIZE);
+	char path[PATH_MAX];
+	int link_fd, fd, i;
+
+	snprintf(path, sizeof(path), "%s/link", dir);
+	link_fd = bpf_obj_get(path);
+	if (link_fd < 0) {
+		fprintf(stderr, "--adopt: no scheduler pinned in %s: %s\n", dir, strerror(errno));
+		return -1;
+	}
+	for (i = 0; i < s->map_cnt; i++) {
+		struct bpf_map_skeleton *m =
+			(struct bpf_map_skeleton *)((char *)s->maps + i * s->map_skel_sz);
+		struct bpf_map *map = *m->map;
+		struct bpf_map_info info = {};
+		__u32 len = sizeof(info);
+		size_t size;
+		void *mem;
+
+		if (bpf_map__type(map) == BPF_MAP_TYPE_STRUCT_OPS)
+			continue;
+		map_pin_path(path, sizeof(path), dir, map);
+		fd = bpf_obj_get(path);
+		/*
+		 * A loader resizes the exit dump's map before loading
+		 * (UEI_SET_SIZE() in SCX_OPS_LOAD()). Resize this program's
+		 * copy to match the pinned map first: libbpf frees its copy
+		 * by the map's size, and a size taken over from the pinned
+		 * map alone would make it free memory it doesn't own.
+		 */
+		if (fd < 0 || bpf_map_get_info_by_fd(fd, &info, &len) ||
+		    (bpf_map__value_size(map) != info.value_size &&
+		     bpf_map__set_value_size(map, info.value_size)) ||
+		    bpf_map__reuse_fd(map, fd)) {
+			fprintf(stderr, "--adopt: %s: %s\n", path, strerror(errno));
+			return -1;
+		}
+		close(fd);	/* bpf_map__reuse_fd() keeps a copy */
+		if (!m->mmaped)
+			continue;
+		size = (size_t)bpf_map__value_size(map) * bpf_map__max_entries(map);
+		size = (size + page - 1) / page * page;
+		mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, bpf_map__fd(map), 0);
+		if (mem == MAP_FAILED)
+			mem = mmap(NULL, size, PROT_READ, MAP_SHARED, bpf_map__fd(map), 0);
+		if (mem == MAP_FAILED) {
+			fprintf(stderr, "--adopt: %s: %s\n", path, strerror(errno));
+			return -1;
+		}
+		*m->mmaped = mem;
+	}
+	return link_fd;
 }
 
 /* Parse a non-negative integer option or exit. */
@@ -291,6 +551,140 @@ static unsigned long long parse_num(const char *name, const char *s)
 		exit(1);
 	}
 	return v;
+}
+
+/*
+ * --batch-cgroup: the id of the control group at @path, which the policy
+ * compares groups against. A group's id is the inode number of its folder
+ * (on a 64-bit machine; kernfs_id_ino() in the kernel). Returns 0, or says
+ * why not and returns -1.
+ */
+static int batch_cgroup_id(const char *path, u64 *id)
+{
+	struct statfs fs;
+	struct stat st;
+
+	if (statfs(path, &fs) || stat(path, &st)) {
+		fprintf(stderr, "--batch-cgroup %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	if (fs.f_type != CGROUP2_SUPER_MAGIC || !S_ISDIR(st.st_mode)) {
+		fprintf(stderr, "--batch-cgroup %s: not a folder of the control-group "
+			"(version 2) file system\n", path);
+		return -1;
+	}
+	*id = st.st_ino;
+	return 0;
+}
+
+/*
+ * --class=kernel: does the running kernel have bpf_kairos_task_class()?
+ * Its type information (/sys/kernel/btf/vmlinux) lists every function a BPF
+ * program may call. The policy would load without it (it declares it
+ * __weak) and then fail at once; this says why before trying.
+ */
+static bool kernel_has_class(void)
+{
+	struct btf *btf = btf__load_vmlinux_btf();
+	bool has;
+
+	if (!btf)
+		return false;
+	has = btf__find_by_name_kind(btf, "bpf_kairos_task_class", BTF_KIND_FUNC) > 0;
+	btf__free(btf);
+	return has;
+}
+
+/*
+ * --split-order layout: where a CPU sits, as the kernel describes it in
+ * /sys/devices/system/cpu/cpuN. A group is named by its first CPU. A file
+ * that is missing (a kernel without NUMA, an offline CPU) leaves the
+ * default, so CPUs that differ in nothing are ordered by number.
+ */
+struct cpu_place {
+	int cpu;
+	long speed;	/* cpu_capacity: the fastest CPU is 1024 */
+	long node;	/* the memory node it is near */
+	long llc;	/* the CPUs sharing its last-level cache */
+	long cluster;	/* topology/cluster_cpus_list */
+	long core;	/* topology/core_cpus_list: its core's hardware threads */
+};
+
+/* The first number in the file at @path (a value, or a CPU list such as "4-7"). */
+static long first_number(const char *path, long dflt)
+{
+	FILE *f = fopen(path, "r");
+	long v;
+
+	if (!f)
+		return dflt;
+	if (fscanf(f, "%ld", &v) != 1)
+		v = dflt;
+	fclose(f);
+	return v;
+}
+
+static struct cpu_place read_place(int cpu)
+{
+	struct cpu_place p = { .cpu = cpu, .speed = 1024, .core = cpu };
+	char dir[64], path[128];
+	long level, top = 0;
+	struct dirent *e;
+	DIR *d;
+
+	snprintf(dir, sizeof(dir), "/sys/devices/system/cpu/cpu%d", cpu);
+	snprintf(path, sizeof(path), "%s/cpu_capacity", dir);
+	p.speed = first_number(path, 1024);
+	snprintf(path, sizeof(path), "%s/topology/cluster_cpus_list", dir);
+	p.cluster = first_number(path, 0);
+	snprintf(path, sizeof(path), "%s/topology/core_cpus_list", dir);
+	p.core = first_number(path, cpu);
+
+	/* the node: a link named nodeK in the CPU's folder (with NUMA) */
+	d = opendir(dir);
+	while (d && (e = readdir(d)))
+		if (sscanf(e->d_name, "node%ld", &p.node) == 1)
+			break;
+	if (d)
+		closedir(d);
+
+	/* the last-level cache: the cache/indexI with the highest level */
+	for (int i = 0; ; i++) {
+		snprintf(path, sizeof(path), "%s/cache/index%d/level", dir, i);
+		level = first_number(path, -1);
+		if (level < 0)
+			break;
+		if (level > top) {
+			top = level;
+			snprintf(path, sizeof(path), "%s/cache/index%d/shared_cpu_list", dir, i);
+			p.llc = first_number(path, 0);
+		}
+	}
+	return p;
+}
+
+/*
+ * The LC pool is the first CPUs of the order, so the order says what LC
+ * work gets first: the fastest CPUs; then, so that a growing pool stays
+ * close together, one memory node before the next, one last-level cache
+ * before the next, one cluster before the next, and both hardware threads
+ * of a core side by side; then CPU number.
+ */
+static int compare_place(const void *a, const void *b)
+{
+	const struct cpu_place *x = a, *y = b;
+
+	if (x->speed != y->speed)
+		return x->speed > y->speed ? -1 : 1;
+	if (x->node != y->node)
+		return x->node < y->node ? -1 : 1;
+	if (x->llc != y->llc)
+		return x->llc < y->llc ? -1 : 1;
+	if (x->cluster != y->cluster)
+		return x->cluster < y->cluster ? -1 : 1;
+	if (x->core != y->core)
+		return x->core < y->core ? -1 : 1;
+	return x->cpu - y->cpu;
 }
 
 /* Parse a CPU list such as "0-2" or "0,2-3" into a bitmask, or exit. */
@@ -618,7 +1012,8 @@ static const char csv_header[] =
 int main(int argc, char **argv)
 {
 	struct scx_kairos *skel;
-	struct bpf_link *link;
+	struct bpf_link *link = NULL;
+	int link_fd = -1;	/* --adopt: the pinned link */
 	const char *stats_path = NULL, *diag_path = NULL;
 	unsigned long long split_mask = ~0ULL;
 	long lc_max = -1;	/* -1: all split CPUs */
@@ -631,6 +1026,8 @@ int main(int argc, char **argv)
 	char diag_names[DIAG_GROUPS][DIAG_COMM_LEN] = {};
 	int opt;
 	__u64 ecode;
+	/* set where an output file can't be opened; else from the exit kind */
+	int status = EXIT_UNLOADED, kind;
 
 	argv = expand_main_config(&argc, argv);
 	libbpf_set_print(libbpf_print_fn);
@@ -640,7 +1037,7 @@ restart:
 	optind = 1;
 	skel = SCX_OPS_OPEN(kairos_ops, scx_kairos);
 
-	while ((opt = getopt_long(argc, argv, "apns:tvh", long_opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "apnqs:tvh", long_opts, NULL)) != -1) {
 		switch (opt) {
 		case 'n':
 			skel->rodata->forced_mode = MODE_BATCH;
@@ -719,6 +1116,13 @@ restart:
 			break;
 		case OPT_SPLIT_CPUS:
 			split_mask = parse_cpus("split-cpus", optarg);
+			break;
+		case OPT_SPLIT_ORDER:
+			if (strcmp(optarg, "number") && strcmp(optarg, "layout")) {
+				fprintf(stderr, "--split-order must be 'number' or 'layout'\n");
+				return 1;
+			}
+			split_by_layout = !strcmp(optarg, "layout");
 			break;
 		case OPT_LC_MIN:
 			skel->rodata->lc_min = parse_num("lc-min", optarg);
@@ -801,14 +1205,32 @@ restart:
 			skel->rodata->borrow_slice_ns = parse_num("borrow-slice-us", optarg) * 1000;
 			break;
 		case OPT_CLASS:
-			if (!strcmp(optarg, "run")) {
-				skel->rodata->class_policy = false;
-			} else if (!strcmp(optarg, "policy")) {
-				skel->rodata->class_policy = true;
-			} else {
-				fprintf(stderr, "--class must be 'run' or 'policy'\n");
+			skel->rodata->class_policy = !strcmp(optarg, "policy");
+			skel->rodata->class_cgroup = !strcmp(optarg, "cgroup");
+			skel->rodata->class_kernel = !strcmp(optarg, "kernel");
+			if (strcmp(optarg, "run") && !skel->rodata->class_policy &&
+			    !skel->rodata->class_cgroup && !skel->rodata->class_kernel) {
+				fprintf(stderr, "--class must be 'run', 'policy', 'cgroup' or 'kernel'\n");
 				return 1;
 			}
+			break;
+		case OPT_BATCH_CGROUP:
+			if (batch_cgroup_id(optarg, &skel->rodata->batch_cgid))
+				return 1;
+			break;
+		case OPT_PIN:
+		case OPT_PIN_AND_EXIT:
+		case OPT_ADOPT:
+			if (pin_dir && strcmp(pin_dir, optarg)) {
+				fprintf(stderr, "one --pin, --pin-and-exit or --adopt folder\n");
+				return 1;
+			}
+			pin_dir = optarg;
+			pin_and_exit |= opt == OPT_PIN_AND_EXIT;
+			adopt |= opt == OPT_ADOPT;
+			break;
+		case 'q':
+			quiet = true;
 			break;
 		case 't':
 			skel->rodata->trace_enqueue = true;
@@ -864,15 +1286,44 @@ restart:
 	}
 
 	/*
-	 * Split CPUs get ranks 0, 1, ... in CPU order (the first nr_lc are
-	 * the LC CPUs); the others -1.
+	 * Split CPUs get ranks 0, 1, ... (the first nr_lc are the LC CPUs),
+	 * in CPU order or, with --split-order layout, in the layout's order;
+	 * the others -1. A rank whose next split CPU is on the same core gets
+	 * split_mid_core, and the policy rounds the pool up past it. (By
+	 * number, every CPU is its own core: nothing is rounded.) With
+	 * --split, the order is printed, once, even with --quiet: it says
+	 * where LC work will run.
 	 */
 	{
-		int nr_possible = libbpf_num_possible_cpus(), nr_split = 0;
+		int nr_possible = libbpf_num_possible_cpus(), nr_split = 0, n;
+		struct cpu_place place[KAIROS_MAX_CPUS];
+		long last_core = -1;
 
+		n = nr_possible < KAIROS_MAX_CPUS ? nr_possible : KAIROS_MAX_CPUS;
+		for (int cpu = 0; cpu < n; cpu++)
+			place[cpu] = split_by_layout ? read_place(cpu) :
+				(struct cpu_place){ .cpu = cpu, .core = cpu };
+		if (split_by_layout)
+			qsort(place, n, sizeof(place[0]), compare_place);
 		for (int cpu = 0; cpu < KAIROS_MAX_CPUS; cpu++)
-			skel->rodata->split_rank[cpu] =
-				cpu < nr_possible && (split_mask >> cpu) & 1 ? nr_split++ : -1;
+			skel->rodata->split_rank[cpu] = -1;
+		for (int i = 0; i < n; i++) {
+			if (!((split_mask >> place[i].cpu) & 1))
+				continue;
+			if (nr_split && place[i].core == last_core)
+				skel->rodata->split_mid_core[nr_split - 1] = true;
+			last_core = place[i].core;
+			skel->rodata->split_rank[place[i].cpu] = nr_split++;
+		}
+		/* an adopter's own options don't describe the adopted scheduler */
+		if (skel->rodata->split && !adopt) {
+			printf("scx_kairos: split order");
+			for (int i = 0; i < n; i++)
+				if ((split_mask >> place[i].cpu) & 1)
+					printf(" %d", place[i].cpu);
+			printf("\n");
+			fflush(stdout);
+		}
 		if (lc_max < 0 || lc_max > nr_split)
 			lc_max = nr_split;
 		skel->rodata->lc_max = lc_max;
@@ -916,16 +1367,61 @@ restart:
 			fprintf(stderr, "--preempt-dep-us needs --preempt-wait-us\n");
 			return 1;
 		}
+		if (skel->rodata->class_cgroup != !!skel->rodata->batch_cgid) {
+			fprintf(stderr, "--class=cgroup and --batch-cgroup go together\n");
+			return 1;
+		}
+		if (skel->rodata->class_kernel && !kernel_has_class()) {
+			fprintf(stderr, "--class=kernel: this kernel can't tell a task's class "
+				"(it has no bpf_kairos_task_class(); Kairos's kernel has)\n");
+			return 1;
+		}
 	}
 
-	SCX_OPS_LOAD(skel, kairos_ops, scx_kairos, uei);
-	link = SCX_OPS_ATTACH(skel, kairos_ops, scx_kairos);
+	if (pin_and_exit && adopt) {
+		fprintf(stderr, "--pin-and-exit and --adopt don't go together\n");
+		return 1;
+	}
+	if (adopt) {
+		link_fd = adopt_pins(skel, pin_dir);
+		if (link_fd < 0)
+			return EXIT_NOT_STARTED;
+		if (!quiet)
+			printf("scx_kairos: adopted the scheduler pinned in %s\n", pin_dir);
+	} else {
+		/*
+		 * Old pins, left by a scheduler the kernel unloaded, must go
+		 * before a new one is attached (see release_pins()). With a
+		 * BPF scheduler running they aren't old: don't start.
+		 */
+		if (pin_dir) {
+			if (!no_bpf_scheduler()) {
+				fprintf(stderr, "a BPF scheduler is running: stop it, or --adopt %s\n",
+					pin_dir);
+				return EXIT_NOT_STARTED;
+			}
+			release_pins(pin_dir);
+		}
+		SCX_OPS_LOAD(skel, kairos_ops, scx_kairos, uei);
+		link = SCX_OPS_ATTACH(skel, kairos_ops, scx_kairos);
+		if (pin_dir && pin_all(skel, link, pin_dir)) {
+			release_pins(pin_dir);
+			bpf_link__destroy(link);
+			return EXIT_NOT_STARTED;
+		}
+		if (pin_and_exit) {
+			/* the link pin holds the scheduler; closing ours is fine */
+			printf("scx_kairos: attached; pinned in %s\n", pin_dir);
+			return 0;
+		}
+	}
 
 	if (stats_path && !csv) {
 		csv = fopen(stats_path, "w");
 		if (!csv) {
 			perror(stats_path);
 			exit_req = 1;
+			status = EXIT_NOT_STARTED;
 		} else {
 			fputs(csv_header, csv);
 		}
@@ -935,6 +1431,7 @@ restart:
 		if (!ml.trace) {
 			perror(ml_trace_path);
 			exit_req = 1;
+			status = EXIT_NOT_STARTED;
 		} else {
 			fputs("t_ms,util,queued,demand,ewma,nr_lc,pred\n", ml.trace);
 		}
@@ -944,41 +1441,45 @@ restart:
 		if (!diag_csv) {
 			perror(diag_path);
 			exit_req = 1;
+			status = EXIT_NOT_STARTED;
 		} else {
 			write_diag_header(diag_csv);
 		}
 	}
-	printf("mode=%s lat_slice_us=%llu batch_slice_us=%llu timer_us=%llu "
-	       "fast_shift=%u slow_shift=%u victim=%s batch_min_run_us=%llu "
-	       "lat_target_us=%llu late_max=%.1f%% hold_ms=%llu-%llu signal_cpus=0x%llx "
-	       "split=%d split_cpus=0x%llx lc=%u-%u lc_buffer=%.2f lc_hyst=%.2f borrow_slice_us=%llu "
-	       "borrow_preempt=%d borrower_pick=%s preempt_wait_us=%llu preempt_min_run_us=%llu class=%s kick_idle=%d wake_sync=%d lc_queue=%s claim_borrower=%d max_wait_ms=%llu preempt_dep_us=%llu\n",
-	       skel->rodata->split ? "split" : skel->rodata->adaptive ? "adaptive" :
-	       skel->rodata->forced_mode == MODE_LATENCY ? "latency" : "batch",
-	       (unsigned long long)skel->rodata->lat_slice_ns / 1000,
-	       (unsigned long long)skel->rodata->batch_slice_ns / 1000,
-	       (unsigned long long)skel->rodata->timer_interval_ns / 1000,
-	       skel->rodata->fast_shift, skel->rodata->slow_shift,
-	       skel->rodata->victim_batch_only ? "batch" : "any",
-	       (unsigned long long)skel->rodata->batch_min_run_ns / 1000,
-	       (unsigned long long)skel->rodata->lat_target_ns / 1000,
-	       100.0 * skel->rodata->late_max / LATE_ONE,
-	       (unsigned long long)skel->rodata->hold_min_ns / 1000000,
-	       (unsigned long long)skel->rodata->hold_max_ns / 1000000,
-	       (unsigned long long)skel->rodata->signal_cpus,
-	       skel->rodata->split, split_mask, skel->rodata->lc_min, skel->rodata->lc_max,
-	       skel->rodata->lc_buffer / 1024.0, skel->rodata->lc_hyst / 1024.0,
-	       (unsigned long long)skel->rodata->borrow_slice_ns / 1000,
-	       skel->rodata->borrow_preempt,
-	       skel->rodata->borrower_pick == PICK_PREV ? "prev" :
-	       skel->rodata->borrower_pick == PICK_LONGEST ? "longest" : "first",
-	       (unsigned long long)skel->rodata->preempt_wait_ns / 1000,
-	       (unsigned long long)skel->rodata->preempt_min_run_ns / 1000,
-	       skel->rodata->class_policy ? "policy" : "run", skel->rodata->kick_idle,
-	       skel->rodata->wake_sync, skel->rodata->lc_percpu ? "percpu" : "shared",
-	       skel->rodata->claim_borrower,
-	       (unsigned long long)skel->rodata->max_wait_ns / 1000000,
-	       (unsigned long long)skel->rodata->preempt_dep_ns / 1000);
+	if (!quiet)
+		printf("mode=%s lat_slice_us=%llu batch_slice_us=%llu timer_us=%llu "
+		       "fast_shift=%u slow_shift=%u victim=%s batch_min_run_us=%llu "
+		       "lat_target_us=%llu late_max=%.1f%% hold_ms=%llu-%llu signal_cpus=0x%llx "
+		       "split=%d split_cpus=0x%llx lc=%u-%u lc_buffer=%.2f lc_hyst=%.2f borrow_slice_us=%llu "
+		       "borrow_preempt=%d borrower_pick=%s preempt_wait_us=%llu preempt_min_run_us=%llu class=%s kick_idle=%d wake_sync=%d lc_queue=%s claim_borrower=%d max_wait_ms=%llu preempt_dep_us=%llu\n",
+		       skel->rodata->split ? "split" : skel->rodata->adaptive ? "adaptive" :
+		       skel->rodata->forced_mode == MODE_LATENCY ? "latency" : "batch",
+		       (unsigned long long)skel->rodata->lat_slice_ns / 1000,
+		       (unsigned long long)skel->rodata->batch_slice_ns / 1000,
+		       (unsigned long long)skel->rodata->timer_interval_ns / 1000,
+		       skel->rodata->fast_shift, skel->rodata->slow_shift,
+		       skel->rodata->victim_batch_only ? "batch" : "any",
+		       (unsigned long long)skel->rodata->batch_min_run_ns / 1000,
+		       (unsigned long long)skel->rodata->lat_target_ns / 1000,
+		       100.0 * skel->rodata->late_max / LATE_ONE,
+		       (unsigned long long)skel->rodata->hold_min_ns / 1000000,
+		       (unsigned long long)skel->rodata->hold_max_ns / 1000000,
+		       (unsigned long long)skel->rodata->signal_cpus,
+		       skel->rodata->split, split_mask, skel->rodata->lc_min, skel->rodata->lc_max,
+		       skel->rodata->lc_buffer / 1024.0, skel->rodata->lc_hyst / 1024.0,
+		       (unsigned long long)skel->rodata->borrow_slice_ns / 1000,
+		       skel->rodata->borrow_preempt,
+		       skel->rodata->borrower_pick == PICK_PREV ? "prev" :
+		       skel->rodata->borrower_pick == PICK_LONGEST ? "longest" : "first",
+		       (unsigned long long)skel->rodata->preempt_wait_ns / 1000,
+		       (unsigned long long)skel->rodata->preempt_min_run_ns / 1000,
+		       skel->rodata->class_kernel ? "kernel" :
+		       skel->rodata->class_cgroup ? "cgroup" :
+		       skel->rodata->class_policy ? "policy" : "run", skel->rodata->kick_idle,
+		       skel->rodata->wake_sync, skel->rodata->lc_percpu ? "percpu" : "shared",
+		       skel->rodata->claim_borrower,
+		       (unsigned long long)skel->rodata->max_wait_ns / 1000000,
+		       (unsigned long long)skel->rodata->preempt_dep_ns / 1000);
 
 	__u64 prev[KAIROS_NR_STATS] = {};
 	struct diag diag_prev, diag_cur;
@@ -1063,27 +1564,29 @@ restart:
 			prev_pre_on[i] = n;
 		}
 
-		printf("local=%llu global=%llu preempt=%llu (batch %llu) no_victim=%llu "
-		       "class +%llu -%llu runnable=%lld (kernel %ld) load fast=%.2f slow=%.2f "
-		       "wakeups/s=%llu wait avg=%.0fus max=%.0fus kick=%llu\n",
-		       d[STAT_LOCAL], d[STAT_GLOBAL], d[STAT_PREEMPT], d[STAT_PREEMPT_BATCH],
-		       d[STAT_NO_VICTIM], d[STAT_TO_BATCH], d[STAT_FROM_BATCH],
-		       (long long)skel->bss->nr_runnable, procs_running(), fast, slow,
-		       (unsigned long long)skel->bss->wake_rate, wait_avg_us, wait_max_us,
-		       d[STAT_KICK]);
-		printf("  mode=%s late %llu/%llu (ewma %.1f%%) switches=%llu latency_ms=%.0f\n",
-		       skel->bss->mode == MODE_LATENCY ? "latency" : "batch",
-		       ll - prev_ll, lw - prev_lw, 100 * late_frac, sw - prev_sw, lat_ms);
-		if (skel->rodata->split)
-			printf("  split: lc_cpus now %u, avg %.2f, demand %.2f, changes %llu, borrow %llu "
-			       "delayed %llu late_preempt %llu\n",
-			       skel->bss->nr_lc, lc_cpus, lc_demand, lc_ch - prev_lc_ch,
-			       d[STAT_BORROW], d[STAT_DELAYED], d[STAT_LATE_PREEMPT]);
-		printf("  idle cpus %.2f (%.2f with a task queued) preempted per cpu %s sync %llu "
-		       "dup_pick %llu (alt %llu) overdue %llu dep %llu\n",
-		       idle_cpus, idle_queued, pre_cpus, d[STAT_SYNC], d[STAT_DUP_PICK],
-		       d[STAT_DUP_ALT], d[STAT_OVERDUE], d[STAT_DEP]);
-		fflush(stdout);
+		if (!quiet) {
+			printf("local=%llu global=%llu preempt=%llu (batch %llu) no_victim=%llu "
+			       "class +%llu -%llu runnable=%lld (kernel %ld) load fast=%.2f slow=%.2f "
+			       "wakeups/s=%llu wait avg=%.0fus max=%.0fus kick=%llu\n",
+			       d[STAT_LOCAL], d[STAT_GLOBAL], d[STAT_PREEMPT], d[STAT_PREEMPT_BATCH],
+			       d[STAT_NO_VICTIM], d[STAT_TO_BATCH], d[STAT_FROM_BATCH],
+			       (long long)skel->bss->nr_runnable, procs_running(), fast, slow,
+			       (unsigned long long)skel->bss->wake_rate, wait_avg_us, wait_max_us,
+			       d[STAT_KICK]);
+			printf("  mode=%s late %llu/%llu (ewma %.1f%%) switches=%llu latency_ms=%.0f\n",
+			       skel->bss->mode == MODE_LATENCY ? "latency" : "batch",
+			       ll - prev_ll, lw - prev_lw, 100 * late_frac, sw - prev_sw, lat_ms);
+			if (skel->rodata->split)
+				printf("  split: lc_cpus now %u, avg %.2f, demand %.2f, changes %llu, borrow %llu "
+				       "delayed %llu late_preempt %llu\n",
+				       skel->bss->nr_lc, lc_cpus, lc_demand, lc_ch - prev_lc_ch,
+				       d[STAT_BORROW], d[STAT_DELAYED], d[STAT_LATE_PREEMPT]);
+			printf("  idle cpus %.2f (%.2f with a task queued) preempted per cpu %s sync %llu "
+			       "dup_pick %llu (alt %llu) overdue %llu dep %llu\n",
+			       idle_cpus, idle_queued, pre_cpus, d[STAT_SYNC], d[STAT_DUP_PICK],
+			       d[STAT_DUP_ALT], d[STAT_OVERDUE], d[STAT_DEP]);
+			fflush(stdout);
+		}
 
 		if (csv) {
 			clock_gettime(CLOCK_REALTIME, &ts);
@@ -1124,11 +1627,23 @@ restart:
 		prev_idleq_ns = idleq_ns;
 	}
 
-	bpf_link__destroy(link);
+	/*
+	 * Stopping or stopped: the pins go first, so that closing the link
+	 * (ours, or the adopted one) drops the last reference and unloads the
+	 * scheduler before UEI_REPORT() reads why it ended.
+	 */
+	if (pin_dir)
+		release_pins(pin_dir);
+	if (adopt)
+		close(link_fd);
+	else
+		bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
+	kind = skel->data->uei.kind;	/* gone with the skeleton */
 	scx_kairos__destroy(skel);
 
-	if (UEI_ECODE_RESTART(ecode))
+	/* an adopter leaves restarts to whoever started it: there is no pin left */
+	if (UEI_ECODE_RESTART(ecode) && !adopt)
 		goto restart;
 	if (csv)
 		fclose(csv);
@@ -1136,5 +1651,5 @@ restart:
 		fclose(diag_csv);
 	if (ml.trace)
 		fclose(ml.trace);
-	return 0;
+	return status ? status : exit_status(kind);
 }

@@ -1056,6 +1056,127 @@ choices. Add as you go.)
 - **`--help` regrouped** (same commit): the main configuration; the
   split; slices and timing; options for experiments and ablations only,
   each marked with its experiment; the first design's modes; output.
+- **`--class=cgroup` (2026-11-20, branch `kairos-os` only).** For the
+  Kairos OS, whose service manager puts each service in a control group
+  under one for its class. Batch = in the group `--batch-cgroup PATH`
+  names or below it, or policy `SCHED_BATCH`/`SCHED_IDLE` (a task can
+  lower itself, not raise itself). `--main-config` is unchanged; Kairos
+  adds the two options after it.
+  - **Which group.** The scheduler's view of a task's group: the nearest
+    one, going up, that the cgroup v2 CPU controller applies to
+    (`p->sched_task_group`). The kernel passes it to `ops.init_task()`
+    (`args->cgroup`, with `CONFIG_EXT_GROUP_SCHED`; at fork and for every
+    task when the scheduler is loaded) and to `ops.cgroup_move()`. The
+    answer is kept in `task_ctx.in_batch_cgroup`, so `task_batch()` costs
+    no more than with `--class=policy`.
+  - **The id.** The loader passes the group's id: the inode number of its
+    folder (equal on 64-bit, `kernfs_id_ino()`), after checking with
+    `statfs()` that the folder is on cgroup2 (`CGROUP2_SUPER_MAGIC`).
+    `kairos_init()` looks the group up with `bpf_cgroup_from_id()` and
+    keeps its depth; a task's group is in batch if its ancestor at that
+    depth (`bpf_cgroup_ancestor()`) has the batch group's id.
+  - **Verifier.** `bpf_cgroup_ancestor()` is `KF_RCU`: it takes only a
+    trusted pointer. `cgroup_move()`'s `to` is one (a callback argument);
+    `init_task()`'s `args->cgroup` isn't (a pointer read from a field of an
+    argument): "R1 must be a rcu pointer". So `init_task()` reads
+    `args->cgroup->kn->id` (plain loads through an untrusted pointer are
+    allowed) and takes a reference with `bpf_cgroup_from_id()` first.
+  - Not used: `scx_bpf_task_cgroup()`, which is allowed only in callbacks
+    that hold the task's run-queue lock; `init_task()` doesn't.
+- **`--class=kernel` (2026-11-23, branch `kairos-os` only).** Batch = the
+  kernel's class for the task is batch, or policy `SCHED_BATCH`/
+  `SCHED_IDLE`. The Kairos OS kernel keeps a class for every control
+  group (its own cgroup controller, `kairos.class`, inherited by the
+  groups below) and exports `enum kairos_class
+  bpf_kairos_task_class(struct task_struct *)` to struct_ops programs
+  (0 = LC, 1 = batch).
+  - **Asked at each decision**, in `task_batch()`: no note in `task_ctx`,
+    no `init_task()` or `cgroup_move()` work, and a write to a group's
+    class applies from each task's next decision. The kfunc follows the
+    task's css_set under RCU: a few loads.
+  - **Not in `init_task()` or `enable()`.** Fork moves a new task into
+    its group (`cgroup_post_fork()`) after `sched_cgroup_fork()` and
+    `sched_post_fork()`, which call them; until then the task points at
+    `init_css_set`, and the answer is the root's, LC.
+  - **Loads without it.** Declared `__ksym __weak`; `kernel_batch()` is
+    guarded by `bpf_ksym_exists()`, so on another kernel the verifier
+    drops the call. libbpf matches an extern's return type by kind only
+    (any enum matches any enum, `__bpf_core_types_are_compat()`), so a
+    local `enum kairos_os_class` with the same numbers stands in for the
+    kernel's and the file compiles against any `vmlinux.h`. The loader
+    refuses `--class=kernel` when `/sys/kernel/btf/vmlinux` has no such
+    function (`btf__find_by_name_kind()`), and `kairos_init()` errors out
+    too, for a program loaded another way.
+- **`pick_victim()` fixed (same day).** It judged a running task's class
+  by the run-time rule unless `--class=policy`, so under `--class=cgroup`
+  it ignored the group. Now only `--class=run` is judged live
+  (`class_by_run()`); every other rule uses `cpu_ctx.batch`, noted when
+  the task started running. Only reached without `--split`, which the
+  Kairos OS always uses.
+- **`--split-order layout` (2026-11-23, branch `kairos-os` only).** The
+  order in which split CPUs become LC CPUs (`split_rank`), read once at
+  load from `/sys/devices/system/cpu/cpuN`: `cpu_capacity` descending;
+  then ascending the memory node (a `nodeK` link in the CPU's folder),
+  the last-level cache (the highest `cache/indexI/level`, named by the
+  first CPU of its `shared_cpu_list`), the cluster
+  (`topology/cluster_cpus_list`) and the core
+  (`topology/core_cpus_list`); then the CPU number. A missing file
+  leaves a default, so CPUs that differ in nothing keep number order.
+  The default stays `number`, so `--main-config` is as evaluated.
+  - **Once, at load:** the layout doesn't change while the system runs
+    (no CPU hotplug in the Kairos kernel; frequency changes don't
+    reorder cores).
+  - **Whole cores.** `split_mid_core[r]` (rodata, by rank): the split
+    CPU at rank r + 1 is on the same core as the one at rank r.
+    `round_to_cores()` grows `nr_lc` past such ranks, after the
+    hysteresis and the `lc_min`/`lc_max` clamp and never past `lc_max`
+    (a `bpf_for` bounded by `KAIROS_MAX_CPUS`; `MEMBER_VPTR` for the
+    index n - 1). By number every CPU counts as its own core, so
+    nothing is rounded.
+  - The order is printed once at load, even with `--quiet`
+    ("scx_kairos: split order ...").
+  - Not done: a rule per wakeup that keeps batch off the other thread
+    of a core running LC work. It can't be measured in QEMU, whose
+    threads share no real core.
+- **`--pin`, `--pin-and-exit`, `--adopt DIR` (2026-11-24, branch
+  `kairos-os` only).** The scheduler held by pins in a BPF file system
+  folder rather than by the loader, so the Kairos kernel can attach it
+  before init and init can watch it.
+  - **Pins:** every map but the struct_ops one as `DIR/<name>` (dots
+    made underscores; libbpf's internal names, e.g. `scx_kair_bss`,
+    `_data_uei_dump`), then the link as `DIR/link`. While the link pin
+    exists the scheduler stays attached, whatever happens to the loader.
+  - **`--adopt`:** no load. Each skeleton map takes its pin's fd
+    (`bpf_map__reuse_fd()`), and `.bss`/`.data`/`.rodata` are mmapped
+    and put in the skeleton's pointers, so the stats loop,
+    `UEI_EXITED()` and `UEI_REPORT()` run unchanged. `.rodata` is frozen:
+    read-only mmap. The exit dump map is resized by a loader before load
+    (`UEI_SET_SIZE()`), so the adopter first sets its copy to the pinned
+    size (`bpf_map__set_value_size()`); without that, libbpf freed its
+    copy by the pinned size at exit: a segfault after `EXIT:`.
+  - **Releasing:** the last reference to a struct_ops link unregisters
+    it, and sched_ext's unregister unloads whichever scheduler is
+    current (`bpf_scx_unreg()` -> `scx_disable()` on `scx_root`), not
+    necessarily this link's. Removing a pin drops its reference later, in
+    a worker (`bpf_link_put()`); closing an fd drops it before `close()`
+    returns (`bpf_link_release()` -> `bpf_link_put_direct()`). So pins
+    are removed by opening the link, unlinking, closing
+    (`release_pins()`): the release happens there, never behind a later
+    scheduler's back. A load with `--pin` removes old pins first, and
+    refuses to start while sched_ext's state isn't `disabled`.
+  - **Stopping** (SIGINT/SIGTERM) removes the pins, then closes the link:
+    unloaded, status 0, as before. An adopter never restarts by itself
+    (`UEI_ECODE_RESTART`): whoever started it loads anew.
+  - **Timers stop at exit (same day).** The policy's BPF timers live as
+    long as its maps, and pins keep the maps of a scheduler the kernel
+    unloaded. `kairos_timerfn()` re-armed itself and called
+    `scx_bpf_get_idle_cpumask()` every tick; kfuncs act on `scx_root`,
+    whichever scheduler is current. A new scheduler loaded beside such
+    pins was unloaded during its start-up: "runtime error (built-in idle
+    tracking is disabled)" (`scx_enable()` sets `scx_root` before
+    `scx_idle_enable()`; `check_builtin_idle_enabled()` errors against
+    the root). Now `kairos_exit()` sets `exited`, and both timer
+    callbacks return without re-arming once it is set.
 
 ---
 
@@ -5899,3 +6020,236 @@ lead. Not yet checked on GitHub.
 **Problems:** The margin is about 9 KB, so new Python can flip it back.
 
 **Next:** final report and video.
+
+### 2026-11-17 — Branch kairos-os: a quiet loader with an exit status
+**Commit:** 5a38f5f
+**Did:**
+- New branch `kairos-os`, for changes made for the Kairos OS (the
+  repository that includes this one as a submodule and starts the loader
+  from its init). `main` stays as evaluated.
+- Loader, `-q`/`--quiet`: no configuration line and no per-second stats on
+  stdout. `--stats` and `--diag` still write their files. Errors and the
+  exit reason still go to stderr.
+- Loader, exit status: says why it ended, for an init or a service manager
+  that has to decide whether to start it again.
+  - 0: unloaded on request (SIGINT or SIGTERM to the loader);
+  - 1: did not start (bad option, load or attach refused, or an output
+    file that can't be opened; the last gave 0 before);
+  - 3: the kernel unloaded it without an error (SysRq-S, or the kernel or
+    the policy asked);
+  - 4: the kernel unloaded it after an error;
+  - 5: the kernel's watchdog unloaded it (a runnable task waited too long).
+
+  Before, every unload gave 0. The kinds are read by name from the
+  running kernel (`__COMPAT_ENUM_OR_ZERO("scx_exit_kind", ...)`).
+- The policy (`scx_kairos.bpf.c`) is unchanged.
+
+No new runs.
+
+**Found:**
+- Tested on the VM's kernel (7.0.0-42): SIGTERM gives 0; `--lc-min x`
+  gives 1; a second loader while one is attached gives 1 ("Device or
+  resource busy"); SysRq-S gives 3 ("EXIT: disabled by sysrq-S"). 4 and 5
+  were not triggered; they differ from 3 only in the kind.
+- From the OS work, about the evaluation kernel: the kernel notices a
+  used-up slice on its tick (1000 a second there), and a task that starts
+  just after a tick has a few microseconds of a 3 ms slice left on the
+  third. Two busy LC tasks sharing one CPU under `--main-config` ran
+  4.0 ms at a time (1263 involuntary switches of one task in 10 s). The
+  numbers for other slices and tick rates are in the Kairos OS
+  repository, commit "Kernel: 1000 ticks a second".
+
+**Interpretation:** For LC tasks that use their whole slice back to back,
+`--lat-slice-us 3000` behaved as 4 ms in the evaluation. Tasks that sleep
+before the slice ends are not affected. Not checked: what this means for
+any result in section 6.
+
+**Decisions:** OS-only changes to the loader or the policy go on this
+branch.
+
+**Problems:** The branch isn't on GitHub yet.
+
+**Next:** Kairos's init starts the loader with `--main-config --quiet`
+and restarts it according to the exit status.
+
+### 2026-11-20 — Branch kairos-os: class by control group
+**Did:**
+- `--class=cgroup` and `--batch-cgroup PATH` (section 4): batch = in
+  that control group or below it, or policy `SCHED_BATCH`/`SCHED_IDLE`.
+  The policy implements `ops.cgroup_move()` and fills the new field
+  `task_ctx.in_batch_cgroup` in `ops.init_task()`.
+- `--class=run` and `--class=policy` and `--main-config` are unchanged.
+
+No new runs.
+
+**Found:**
+- First load refused by the verifier: `bpf_cgroup_ancestor()` on
+  `args->cgroup` in `init_task()`, "R1 must be a rcu pointer"; fixed by
+  taking a reference by id first (section 4).
+- Tested on the Kairos kernel in QEMU (4 CPUs, Kairos's control groups,
+  loader started by hand with `--main-config --class=cgroup
+  --batch-cgroup=/sys/fs/cgroup/batch --stats`), with 4 busy loops,
+  per-second values of `nr_lc` and `borrow` from the stats CSV:
+  - loops in the root group: 4 LC CPUs, 0 borrows;
+  - moved into the batch group: 2 LC CPUs, 2 borrows a second;
+  - moved back: 4 LC CPUs again, 0 borrows;
+  - started in the batch group before the scheduler was loaded: 2 LC
+    CPUs, 2 to 3 borrows a second (the `init_task()` path).
+- The loader errors: `--class=cgroup` without `--batch-cgroup`, and a
+  folder that isn't on cgroup2, each give status 1.
+- Builds against the VM's kernel tree too (`~/linux-src`). Not loaded on
+  the VM.
+
+**Interpretation:** The class follows a task into and out of the batch
+group, and the LC pool follows the class. The policy half of the rule
+(a task lowering itself) wasn't tried: the Kairos image has no `chrt`.
+
+**Decisions:** None beyond section 4.
+
+**Problems:** The branch isn't on GitHub yet.
+
+**Next:** Kairos's init passes `--class=cgroup
+--batch-cgroup=/sys/fs/cgroup/batch`; its service manager starts each
+service in a group under `lc` or `batch`.
+
+### 2026-11-23 — Branch kairos-os: class from the kernel
+**Did:**
+- `--class=kernel` (section 4): batch = the class Kairos's kernel keeps
+  for the task's control group, read with `bpf_kairos_task_class()` at
+  each decision, or policy `SCHED_BATCH`/`SCHED_IDLE`.
+- Fixed `pick_victim()`: a victim's class by the chosen rule, not by run
+  time under `--class=cgroup` (section 4).
+
+No new runs.
+
+**Found:** Tested in QEMU on the Kairos kernel (4 CPUs), loader started
+by hand, 4 busy loops (the service crunch) in a group below `batch`,
+and a probe waking every 2 ms (4 s, median lateness):
+- `--main-config --class=kernel`: crunch as batch: 336 us, 2 LC CPUs,
+  ~540 borrows a second; after one write of `lc` to crunch's group,
+  while it ran: 2414 us, 4 LC CPUs, LC demand 5.1, 0 borrows; after
+  `inherit`: 479 us, 2 LC CPUs, ~530 borrows. Emulated timing (TCG):
+  compare within the run only.
+- `--force-preempt --class=kernel` (no split): crunch as batch, 471 of
+  472 preemptions a second hit batch tasks; as LC, 0 of 489.
+- On the Kairos kernel without its patches: `--class=cgroup` loads (the
+  weak call dropped); `--class=kernel` is refused with status 1.
+- On a lockdep and PROVE_RCU build: no reports with the kfunc called at
+  each decision and 20 class writes in a row.
+- Builds against the VM's kernel tree (`~/linux-src`), whose `vmlinux.h`
+  has no `kairos_class`.
+
+**Interpretation:** The class follows a write to the group while the
+tasks run, with no restart and no callback; the LC pool follows it
+within a second.
+
+**Decisions:** Read the class at each decision rather than keep a copy:
+the read is a few loads, and a copy would need the kernel to call the
+policy on every class change.
+
+**Problems:** None.
+
+**Next:** Kairos's init writes `batch` to its batch group's
+`kairos.class` and starts the loader with `--class=kernel`.
+
+### 2026-11-23 — Branch kairos-os: the LC pool by CPU layout
+**Did:** `--split-order number|layout`, and the LC pool rounded up to
+whole cores under `layout` (section 4). No new runs.
+
+**Found:** Tested in QEMU on the Kairos kernel with CPU layouts QEMU
+presents (unequal speeds through an edited device tree), loader started
+by hand with `--main-config --class=kernel`:
+- Orders: 4 equal CPUs `0 1 2 3`; 2 clusters x 2 cores x 2 threads
+  `0 1 2 3 4 5 6 7` (QEMU numbers a core's threads side by side); CPUs
+  4-7 twice as fast `4 5 6 7 0 1 2 3`; 2 memory nodes (node 0: CPUs 0-1
+  and 4-5) `0 1 4 5 2 3 6 7`. The probe (LC; pool of 2) ran on the
+  order's first two CPUs in 96 of 100 samples on each of the last three.
+- 2 x 2 x 2 threads, `--lc-min 3`: pool 4 by layout, 3 by number, 3 by
+  layout with `--lc-max 3`. 4 equal CPUs, by layout: 3.
+- 2 x 2 x 2 threads, an LC loop that runs and sleeps (LC demand ~1.1):
+  pool 2, 4 while it ran, 2 after, by layout; 2, 3, 2 by number.
+- A lone CPU-bound LC task on an otherwise idle machine: LC demand read
+  0.06 for seconds, then 4-9 at once. When a CPU has nothing else to
+  run, sched_ext keeps the running task and refills its slice
+  (`balance_one()`, `SCX_RQ_BAL_KEEP` without `SCX_OPS_ENQ_LAST`), so
+  `stopping()`, where `lc_run_ns` is added, isn't called until
+  something else needs the CPU. The same on `main`. Only on an idle
+  machine, where the pool's size matters least (a guess: not measured
+  under load).
+
+**Interpretation:** Placement only. Whether whole cores or fast CPUs
+first speed up LC work can't be measured in emulation.
+
+**Decisions:** The layout is read once at load: it doesn't change while
+the system runs. Round up, not down: the pool is there to give LC work
+spare capacity. Number order unchanged, so `--main-config` stays as
+evaluated.
+
+**Problems:** None.
+
+**Next:** Kairos's init starts the loader with `--split-order=layout`.
+
+### 2026-11-24 — Branch kairos-os: the scheduler held by a pin
+**Did:** `--pin`, `--pin-and-exit` and `--adopt DIR` (section 4), for the
+Kairos OS: its kernel will attach the scheduler before init with
+`--pin-and-exit`, and init will watch it with `--adopt`. No new runs.
+
+**Found:** Tested by hand in QEMU on the Kairos kernel (4 CPUs, the
+scheduler off at boot, a BPF file system on `/sys/fs/bpf`):
+- `--pin-and-exit`: status 0; the scheduler enabled; 11 pins (10 maps
+  and the link).
+- An adopter killed with SIGKILL: still enabled, sched_ext's
+  `enable_seq` unchanged (1). A `--pin` loader killed the same way: the
+  same.
+- An adopter's statistics as a loader's (`split: lc_cpus now 2 ...`).
+  SIGTERM to an adopter or a `--pin` loader: "disabled (unregistered from
+  user space)", `EXIT: unregistered from user space`, status 0, no pins
+  left.
+- A second `--pin` load while one runs: refused, status 1, the running
+  one untouched.
+- First version: the adopter segfaulted (status 139) after `EXIT:`;
+  libbpf freed its copy of the exit dump map by the pinned, larger size.
+  Fixed by resizing the copy first.
+- Not tested yet: pins left by a scheduler the kernel unloaded (needs
+  SysRq-S, not in the Kairos kernel's main config).
+
+**Interpretation:** The scheduler's lifetime is now the pin's, not a
+process's.
+
+**Decisions:** Release pins by open, unlink, close, so that the last
+reference is dropped synchronously (section 4). Refuse a `--pin` load
+while any BPF scheduler runs, rather than remove its pins.
+
+**Problems:** The segfault above.
+
+**Next:** Kairos's init adopts a scheduler attached before it, and its
+kernel attaches one.
+
+### 2026-11-24 — Branch kairos-os: timers stop when the scheduler exits
+**Did:** `kairos_exit()` sets `exited`; `kairos_timerfn()` and
+`wait_timerfn()` stop re-arming once it is set (section 4). No new runs.
+
+**Found:** QEMU, the Kairos lock-checking kernel (SysRq on), the
+scheduler attached and pinned, then unloaded by SysRq-S with its pins
+left in place:
+- Before the fix, a new scheduler loaded beside the old pins was unloaded
+  during its start-up: "runtime error (built-in idle tracking is
+  disabled)". The old timer was still firing and calling idle kfuncs.
+- After it, the new scheduler loads and runs (`enable_seq` 2). Removing
+  the old link's pin then unloads the new one: "disabled (unregistered
+  from user space)". That is sched_ext's unregister acting on the current
+  scheduler, which `--pin` guards against by removing old pins before a
+  load. Through Kairos's init (kill the adopter, SysRq-S, init reloads
+  with `--pin`): the new scheduler runs and is still enabled 6 s later.
+- No lockdep or RCU reports. Kairos's boot test 22 of 22 at 4 CPUs and on
+  2 clusters x 2 cores x 2 threads.
+
+**Interpretation:** A pinned scheduler outlives its exit as BPF objects;
+anything it runs on its own (timers) must stop at exit.
+
+**Decisions:** Stop the timers by a flag set in ops.exit() rather than
+`bpf_timer_cancel()`: the callbacks are the only place that re-arms.
+
+**Problems:** The start-up failure above.
+
+**Next:** Pin moved in the Kairos OS; its component 8 wrap-up.

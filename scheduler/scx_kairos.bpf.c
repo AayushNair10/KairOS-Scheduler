@@ -120,13 +120,61 @@ const volatile u64 signal_cpus = ~0ULL;
  */
 const volatile bool class_policy;
 /*
+ * With class_cgroup (--class=cgroup, for the Kairos OS): batch = the task
+ * is in the control group whose id is batch_cgid, or in a group below it,
+ * or has the SCHED_BATCH or SCHED_IDLE policy. So a task can lower its own
+ * class but not raise it out of the batch group.
+ *
+ * The group is the scheduler's view of the task's group: the nearest one,
+ * going up, that the CPU controller applies to. The kernel passes it to
+ * init_task() when a task is created (or when this scheduler is loaded)
+ * and to cgroup_move() when a task moves; the answer is kept in the task's
+ * context, so a wakeup costs no more than with class_policy.
+ *
+ * batch_level is the batch group's depth in the tree (the root is 0),
+ * found from its id in kairos_init().
+ */
+const volatile bool class_cgroup;
+const volatile u64 batch_cgid;
+static int batch_level;
+/*
+ * With class_kernel (--class=kernel, for the Kairos OS): batch = the
+ * kernel's class for the task is batch, or it has the SCHED_BATCH or
+ * SCHED_IDLE policy. Kairos's kernel keeps a class for every control group
+ * (the kairos controller: kairos.class) and tells it with
+ * bpf_kairos_task_class(). It is asked at each decision, so a change to a
+ * group's class applies from each task's next decision, without a
+ * callback.
+ *
+ * Not in init_task() or enable(): fork moves a new task into its group
+ * only after both, so until then the kernel answers with the root group's
+ * class.
+ *
+ * The function exists only in Kairos's kernel. __weak lets this program
+ * load without it; bpf_ksym_exists() is then false and the verifier drops
+ * the call. Its result is the kernel's enum kairos_class. libbpf accepts
+ * any enum where the kernel has one, so a copy of the numbers here lets
+ * this file compile against any kernel's vmlinux.h.
+ */
+const volatile bool class_kernel;
+enum kairos_os_class {
+	KAIROS_OS_CLASS_LC	= 0,
+	KAIROS_OS_CLASS_BATCH	= 1,
+};
+enum kairos_os_class bpf_kairos_task_class(struct task_struct *p) __ksym __weak;
+/*
  * Soft CPU split (--split). split_rank[cpu] is the CPU's position among the
  * split CPUs (-1: not in the split; such CPUs act as LC CPUs). The first
  * nr_lc split CPUs are LC CPUs. nr_lc stays within [lc_min, lc_max]; the
  * timer sets it to ceil(LC demand + lc_buffer), in CPUs x 1024.
+ * split_mid_core[r]: the split CPU at rank r + 1 is a hardware thread of the
+ * same core as the one at rank r, so a pool of r + 1 CPUs would end inside a
+ * core; the timer rounds the pool up past it (--split-order layout puts a
+ * core's threads side by side; by number every CPU counts as its own core).
  */
 const volatile bool split;
 const volatile s32 split_rank[KAIROS_MAX_CPUS];
+const volatile bool split_mid_core[KAIROS_MAX_CPUS];
 const volatile u32 lc_min = 1, lc_max = 1;	/* the loader sets lc_max */
 const volatile u64 lc_buffer = 512;		/* half a CPU */
 /* Shrink the LC pool only if it would still shrink with this much more demand. */
@@ -233,6 +281,18 @@ const volatile char diag_comm[DIAG_NAMED][DIAG_COMM_LEN];
 
 UEI_DEFINE(uei);
 
+/*
+ * Set by kairos_exit(). This program's BPF timers live as long as its maps,
+ * not as long as the scheduler: normally the loader ends right after and
+ * everything is freed, but pins (--pin, the Kairos OS) keep the maps of a
+ * scheduler the kernel unloaded until they are removed. A timer that kept
+ * firing would keep calling sched_ext's kfuncs, which act on whichever
+ * scheduler is current; in a later scheduler's start-up that raised
+ * "built-in idle tracking is disabled" against the new one and unloaded it.
+ * So once the scheduler has exited, the timers stop.
+ */
+bool exited;
+
 #define SHARED_DSQ 0
 #define LC_DSQ 1	/* --split: latency-critical tasks */
 #define BATCH_DSQ 2	/* --split: batch tasks */
@@ -318,6 +378,7 @@ struct task_ctx {
 	u8 group;		/* diagnostics group, set in running() */
 	u8 preempted_in;	/* --diag: its next run starts by preempting */
 	u8 delayed;		/* waits in LC_DSQ for preempt_wait_ns (STAT_DELAYED) */
+	u8 in_batch_cgroup;	/* --class=cgroup: in the batch group or below */
 	u64 avg_run;		/* EWMA of CPU time from waking to sleeping */
 	u64 woke_lc_at;		/* --preempt-dep-us: when it last woke an LC task */
 };
@@ -408,12 +469,83 @@ static bool is_batch(u64 run_since_sleep)
 	return run_since_sleep >= batch_min_run_ns;
 }
 
-/* @p's class now: by policy with class_policy, else by the run-time rule. */
+static bool policy_batch(const struct task_struct *p)
+{
+	return p->policy == SCHED_BATCH || p->policy == SCHED_IDLE;
+}
+
+/*
+ * By the run-time rule (--class=run), a task's class can change while it
+ * runs, so it is judged with what it has run so far. By every other rule it
+ * stays as it was when the task started running (cpu_ctx.batch).
+ */
+static bool class_by_run(void)
+{
+	return !class_policy && !class_cgroup && !class_kernel;
+}
+
+/*
+ * --class=kernel: the kernel's class for @p. The cast drops const only for
+ * the C compiler; the verifier checks that @p is a trusted pointer, which
+ * the task a callback receives is.
+ */
+static bool kernel_batch(const struct task_struct *p)
+{
+	if (!bpf_ksym_exists(bpf_kairos_task_class))
+		return false;
+	return bpf_kairos_task_class((struct task_struct *)p) == KAIROS_OS_CLASS_BATCH;
+}
+
+/*
+ * @p's class now: from the kernel with class_kernel, by group with
+ * class_cgroup, by policy with class_policy, else by the run-time rule.
+ */
 static bool task_batch(const struct task_struct *p, const struct task_ctx *tctx)
 {
+	if (class_kernel)
+		return kernel_batch(p) || policy_batch(p);
+	if (class_cgroup)
+		return (tctx && tctx->in_batch_cgroup) || policy_batch(p);
 	if (class_policy)
-		return p->policy == SCHED_BATCH || p->policy == SCHED_IDLE;
+		return policy_batch(p);
 	return tctx && is_batch(tctx->run_since_sleep);
+}
+
+/*
+ * --class=cgroup: is @cgrp the batch group or below it? Its ancestor at
+ * the batch group's depth is the batch group itself if so.
+ *
+ * Verifier: bpf_cgroup_ancestor() takes only a trusted pointer (an
+ * argument of the callback, or a reference the program holds). A pointer
+ * read from a field of an argument isn't one ("R1 must be a rcu pointer"
+ * for init_task()'s args->cgroup), so cgroup_id_in_batch() first takes a
+ * reference by the group's id.
+ */
+static bool cgroup_in_batch(struct cgroup *cgrp)
+{
+	struct cgroup *anc;
+	bool in;
+
+	if (cgrp->level < batch_level)
+		return false;
+	anc = bpf_cgroup_ancestor(cgrp, batch_level);
+	if (!anc)
+		return false;
+	in = anc->kn->id == batch_cgid;
+	bpf_cgroup_release(anc);
+	return in;
+}
+
+static bool cgroup_id_in_batch(u64 cgid)
+{
+	struct cgroup *cgrp = bpf_cgroup_from_id(cgid);
+	bool in;
+
+	if (!cgrp)
+		return false;
+	in = cgroup_in_batch(cgrp);
+	bpf_cgroup_release(cgrp);
+	return in;
 }
 
 /*
@@ -494,7 +626,7 @@ static s32 pick_victim(struct task_struct *p, u64 vtime, bool *batch)
 			continue;
 		/* what it has run since it started on this CPU */
 		ran = time_after(now, cctx->running_at) ? now - cctx->running_at : 0;
-		b = class_policy ? cctx->batch : is_batch(cctx->run_since_sleep + ran);
+		b = class_by_run() ? is_batch(cctx->run_since_sleep + ran) : cctx->batch;
 		if (victim_batch_only && !b)
 			continue;
 		cur = cctx->vtime + ran * 100 / cctx->weight;
@@ -1261,10 +1393,29 @@ void BPF_STRUCT_OPS(kairos_enable, struct task_struct *p)
 s32 BPF_STRUCT_OPS(kairos_init_task, struct task_struct *p,
 		   struct scx_init_task_args *args)
 {
+	struct task_ctx *tctx;
+
 	/* zero-filled: not batch until it has run batch_min_run_ns */
-	if (!bpf_task_storage_get(&task_ctxs, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE))
+	tctx = bpf_task_storage_get(&task_ctxs, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!tctx)
 		return -ENOMEM;
+	/* a plain read through args->cgroup: allowed, and 0 if it is NULL */
+	if (class_cgroup)
+		tctx->in_batch_cgroup = cgroup_id_in_batch(args->cgroup->kn->id);
 	return 0;
+}
+
+/* --class=cgroup: @p moved to another group; its class may have changed. */
+void BPF_STRUCT_OPS(kairos_cgroup_move, struct task_struct *p,
+		    struct cgroup *from, struct cgroup *to)
+{
+	struct task_ctx *tctx;
+
+	if (!class_cgroup)
+		return;
+	tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
+	if (tctx)
+		tctx->in_batch_cgroup = cgroup_in_batch(to);
 }
 
 static u64 last_tick_at, last_wakeups, last_wait_sum, last_wait_cnt;
@@ -1291,6 +1442,31 @@ static u64 nr_lc_queued(void)
 }
 
 /*
+ * --split: a pool of @n CPUs, grown until it doesn't end inside a core,
+ * but not past lc_max. Hardware threads of one core share its execution
+ * units and caches, so a batch task on the other thread of an LC CPU's core
+ * would slow the LC task down. Rounding up after the hysteresis keeps a
+ * pool of whole cores from shrinking to half a core and growing back.
+ * (n - 1 for n = 0 wraps around, which MEMBER_VPTR rejects; the loader
+ * keeps lc_min >= 1 anyway.)
+ */
+static u32 round_to_cores(u32 n)
+{
+	const volatile bool *mid;
+	u32 i;
+
+	bpf_for(i, 0, KAIROS_MAX_CPUS) {
+		if (n >= lc_max)
+			break;
+		mid = MEMBER_VPTR(split_mid_core, [n - 1]);
+		if (!mid || !*mid)
+			break;
+		n++;
+	}
+	return n;
+}
+
+/*
  * --split: size the LC pool. Demand per tick = CPUs' worth of LC run time
  * in the tick + one CPU per LC task waiting in the LC queue (work that
  * didn't get a CPU), averaged with weight 1/2^lc_shift per tick (~64 ms):
@@ -1299,8 +1475,9 @@ static u64 nr_lc_queued(void)
  * average changed the pool 11-24 times a second on an idle system.)
  * nr_lc = ceil(demand + lc_buffer), within [lc_min, lc_max]; it shrinks
  * only if it would also with lc_hyst more demand, so demand near a whole
- * CPU doesn't flip it back and forth. Tasks keep running where they are
- * when a CPU changes pool; the change applies at their next dispatch.
+ * CPU doesn't flip it back and forth. Then it is rounded up to whole cores
+ * (round_to_cores()). Tasks keep running where they are when a CPU changes
+ * pool; the change applies at their next dispatch.
  */
 static void update_split(u64 dt)
 {
@@ -1335,6 +1512,7 @@ static void update_split(u64 dt)
 		n = lc_min;
 	if (n > lc_max)
 		n = lc_max;
+	n = round_to_cores(n);
 	if (n != nr_lc) {
 		nr_lc = n;
 		nr_lc_changes++;
@@ -1449,6 +1627,9 @@ static int kairos_timerfn(void *map, int *key, struct bpf_timer *timer)
 	s64 nr = nr_runnable;
 	u64 load = nr > 0 ? (u64)nr * 1024 / nr_cpus : 0;
 
+	if (exited)	/* not re-armed: the timer stops */
+		return 0;
+
 	fast_load = ewma(fast_load, load, fast_shift);
 	slow_load = ewma(slow_load, load, slow_shift);
 
@@ -1508,6 +1689,9 @@ static int wait_timerfn(void *map, int *key, struct bpf_timer *timer)
 	struct task_struct *p;
 	s32 cpu, alt, prev = -1;
 
+	if (exited)
+		return 0;
+
 	wait_timer_armed = 0;
 	bpf_for_each(scx_dsq, p, LC_DSQ, 0) {
 		struct task_ctx *tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
@@ -1557,6 +1741,22 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(kairos_init)
 		scx_bpf_error("%u CPUs, at most %d supported", nr_cpus, KAIROS_MAX_CPUS);
 		return -E2BIG;
 	}
+	if (class_cgroup) {
+		struct cgroup *batch = bpf_cgroup_from_id(batch_cgid);
+
+		if (!batch) {
+			scx_bpf_error("no control group with id %llu", batch_cgid);
+			return -ENOENT;
+		}
+		batch_level = batch->level;
+		bpf_cgroup_release(batch);
+	}
+	/* the loader checks this too; a program loaded another way may not */
+	if (class_kernel && !bpf_ksym_exists(bpf_kairos_task_class)) {
+		scx_bpf_error("--class=kernel: this kernel has no bpf_kairos_task_class()");
+		return -ENOENT;
+	}
+
 	/* adaptive starts in LATENCY mode, the safe one for latency */
 	mode = adaptive ? MODE_LATENCY : forced_mode;
 	hold_ns = hold_min_ns;
@@ -1603,6 +1803,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(kairos_init)
 
 void BPF_STRUCT_OPS(kairos_exit, struct scx_exit_info *ei)
 {
+	exited = true;
 	UEI_RECORD(uei, ei);
 }
 
@@ -1616,6 +1817,7 @@ SCX_OPS_DEFINE(kairos_ops,
 	       .quiescent		= (void *)kairos_quiescent,
 	       .enable			= (void *)kairos_enable,
 	       .init_task		= (void *)kairos_init_task,
+	       .cgroup_move		= (void *)kairos_cgroup_move,
 	       .init			= (void *)kairos_init,
 	       .exit			= (void *)kairos_exit,
 	       .name			= "kairos");
